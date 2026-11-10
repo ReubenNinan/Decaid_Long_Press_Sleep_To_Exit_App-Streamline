@@ -130,7 +130,7 @@ the patch. On current Decaid releases it behaves exactly like Streamline.js.
 
 Streamline.js is © Decent Espresso, licensed under GPL-3.0 (see `LICENSE.txt`
 and the full license text in `LICENSE`). The skin here is based on
-[allofmeng/streamline_project@cec5664](https://github.com/allofmeng/streamline_project/commit/cec566451f506976a7f30cea11569dc799ef4331).
+[decentespresso/streamline-js v0.2.24 (`10d2bc0`)](https://github.com/decentespresso/streamline-js/commit/10d2bc0).
 Besides the long-press change, it uses its own skin ID (`streamline-sleep-exit`)
-and version (`0.2.18-sleepexit.1`) in `skin-manifest.json` and `src/version.js`.
+and version (`0.2.24-sleepexit.1`) in `skin-manifest.json` and `src/version.js`.
 Its update check (`src/settings/settings.js`) points at this repo.
