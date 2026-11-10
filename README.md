@@ -78,7 +78,8 @@ when the skin may send sleep and wake commands. The decision logic is a small,
 pure, unit-tested function in `screensaver-policy.js`.
 
 **Patch:** [`patches/2-streamline-long-press-sleep.patch`](patches/2-streamline-long-press-sleep.patch)
-against [allofmeng/streamline_project](https://github.com/allofmeng/streamline_project).
+against [decentespresso/streamline-js](https://github.com/decentespresso/streamline-js)
+v0.2.24 (`10d2bc0`). Apply it with `git am`.
 
 The same pattern also works for other skins. An Insight version was written and
 tested along the way.
