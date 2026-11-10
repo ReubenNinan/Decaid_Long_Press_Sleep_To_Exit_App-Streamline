@@ -1,0 +1,6 @@
+{
+  "id": "streamline-sleep-exit",
+  "name": "Streamline.js (Long-Press Sleep Exit)",
+  "description": "Streamline.js with de1app-style long-press Sleep: puts the machine to sleep and exits Decaid",
+  "version": "0.2.18-sleepexit.1"
+}

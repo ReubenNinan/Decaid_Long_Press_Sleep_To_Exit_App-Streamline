@@ -1,0 +1,127 @@
+From 52a3079c49a1a08f7bd0f151a2b264a6c8fea00a Mon Sep 17 00:00:00 2001
+From: Reuben Ninan <reubenninan@yahoo.com>
+Date: Sun, 25 Oct 2026 22:27:29 +0000
+Subject: [PATCH] Long-press Sleep puts the machine to sleep and exits the app
+
+Restores the de1app behaviour: a tap on Sleep still sleeps or wakes the
+machine; holding it for 0.8 s sleeps the machine and, once the gateway
+accepts the request, calls window.decentApp.exitApp() so the tablet can
+be used normally. A long press on "Awake" only wakes, and hosts without
+exitApp() just sleep.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01WabCzdX53ns7vgwepG6uCf
+---
+ src/modules/screensaver-policy.js | 15 +++++++++++++++
+ src/modules/ui.js                 | 17 ++++++++++++++---
+ test/screensaver-policy.test.mjs  | 14 ++++++++++++++
+ 3 files changed, 43 insertions(+), 3 deletions(-)
+
+diff --git a/src/modules/screensaver-policy.js b/src/modules/screensaver-policy.js
+index 93d75f1..c1505e9 100644
+--- a/src/modules/screensaver-policy.js
++++ b/src/modules/screensaver-policy.js
+@@ -138,6 +138,21 @@ export function deriveSleepButtonAction({ machineState, screensaverActive = fals
+     return { command: 'sleeping', hideScreensaver: false };
+ }
+ 
++/** How long Sleep must be held to sleep the machine and leave the app. */
++export const SLEEP_EXIT_HOLD_MS = 800;
++
++/**
++ * Should a long-pressed Sleep leave the app once its command has been accepted?
++ *
++ * The de1app's long-press sleep: put the machine to sleep and hand the tablet
++ * back. Only when the press actually slept the machine (a long press on "Awake"
++ * is just a wake), and only on hosts that offer `decentApp.exitApp()`; older
++ * Decaid builds simply sleep.
++ */
++export function shouldExitAfterSleep(action, decentApp) {
++    return action?.command === 'sleeping' && typeof decentApp?.exitApp === 'function';
++}
++
+ /**
+  * What the panel brightness should do on a machine state TRANSITION.
+  *
+diff --git a/src/modules/ui.js b/src/modules/ui.js
+index f048057..d3e17eb 100644
+--- a/src/modules/ui.js
++++ b/src/modules/ui.js
+@@ -4,7 +4,7 @@ import { getProfile, getWorkflow, updateWorkflow, setMachineState, setTargetHotW
+ import { resolveStatusStateKey, isActionTailSubstate } from './machine-status-policy.js';
+ import { openDB, getSetting } from './idb.js';
+ import { SCREENSAVER_CLOCK_FORMATS, SCREENSAVER_CLOCK_POSITIONS, SCREENSAVER_DATE_FORMATS, formatScreensaverClockDate, formatScreensaverClockTime, screensaverClockPositionStyle } from './screensaver-clock.js';
+-import { deriveSleepButtonAction, isWakePending, mayTapWakeMachine } from './screensaver-policy.js';
++import { deriveSleepButtonAction, isWakePending, mayTapWakeMachine, shouldExitAfterSleep, SLEEP_EXIT_HOLD_MS } from './screensaver-policy.js';
+ import { isBengleMachine, isBengleModel } from './machine.js';
+ import { STEAM_FLOW_PRESETS_BY_MODEL, MILK_STOP_PRESETS, resolveSteamFlowPresetsForModel, resolveSteamTileMode, steamSlotField as resolveSteamSlotField, milkTelemetryValue, steamFlowHighlightIndex, STEAM_SYNC_SYNCED, steamSyncField, foldSteamSyncState, shouldRetrySteamSync, steamSyncRetryDelay } from './steam-mode.js';
+ import { API_DEBOUNCE_MS } from './workflow-watch.js';
+@@ -2556,9 +2556,12 @@ export function initUI(callbacks) {
+         //  2. A fast double-tap could read a stale currentMachineState (it lags the
+         //     machine by a snapshot) and derive the OPPOSITE action, undoing the
+         //     first press. The in-flight guard makes the second tap a no-op.
++        //
++        // Holding the button (SLEEP_EXIT_HOLD_MS) sends the same command and then,
++        // once the machine has accepted a sleep, leaves the app as the de1app did.
+         let sleepRequestInFlight = false;
+ 
+-        sleepButton.addEventListener('click', async () => {
++        const pressSleepButton = async ({ exitApp = false } = {}) => {
+             if (sleepRequestInFlight) return;
+             sleepRequestInFlight = true;
+ 
+@@ -2584,13 +2587,21 @@ export function initUI(callbacks) {
+ 
+                 await setMachineState(action.command);
+                 logger.info(`Sleep button: machine reported "${currentMachineState}" -> requested "${action.command}".`);
++                if (exitApp && shouldExitAfterSleep(action, window.decentApp)) window.decentApp.exitApp();
+             } catch (err) {
+                 logger.error(`Sleep button: failed to set machine state to "${action.command}":`, err);
+                 clearWakeRequest(); // the wake never landed — let the overlay come back
+             } finally {
+                 sleepRequestInFlight = false;
+             }
+-        });
++        };
++
++        setupPressAndHold(
++            sleepButton,
++            () => pressSleepButton(),
++            () => pressSleepButton({ exitApp: true }),
++            { duration: SLEEP_EXIT_HOLD_MS },
++        );
+     }
+ 
+     if (doseInValueEl) {
+diff --git a/test/screensaver-policy.test.mjs b/test/screensaver-policy.test.mjs
+index 56e64e5..195620a 100644
+--- a/test/screensaver-policy.test.mjs
++++ b/test/screensaver-policy.test.mjs
+@@ -20,6 +20,7 @@ import {
+     deriveSleepButtonAction,
+     isMachineAsleep,
+     mayTapWakeMachine,
++    shouldExitAfterSleep,
+     isWakePending,
+     WAKE_CONFIRM_GRACE_MS,
+ } from '../src/modules/screensaver-policy.js';
+@@ -270,3 +271,16 @@ test('a tap on the overlay wakes; a tap on a plugin control or an idle overlay d
+     assert.equal(mayTapWakeMachine({ screensaverActive: false }), false);
+     assert.equal(mayTapWakeMachine(), false);
+ });
++
++// --- shouldExitAfterSleep: long-press Sleep leaves the app only after a sleep ----
++
++test('a long press leaves the app only when it put the machine to sleep and the host can exit', () => {
++    const host = { exitApp() {} };
++    const sleep = deriveSleepButtonAction({ machineState: 'idle' });
++    const wake = deriveSleepButtonAction({ machineState: 'sleeping', screensaverActive: true });
++
++    assert.equal(shouldExitAfterSleep(sleep, host), true);
++    assert.equal(shouldExitAfterSleep(wake, host), false, 'a long press on "Awake" only wakes');
++    assert.equal(shouldExitAfterSleep(sleep, {}), false, 'older hosts without exitApp just sleep');
++    assert.equal(shouldExitAfterSleep(sleep, undefined), false, 'external browsers have no decentApp');
++});
+-- 
+2.43.0
+
