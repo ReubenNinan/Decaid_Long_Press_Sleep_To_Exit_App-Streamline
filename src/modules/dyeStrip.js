@@ -19,14 +19,16 @@
 // in the stored `workflow`). Legacy items without `workflow` fall back to
 // snapshot+copyMask / dashboardVariables.
 
-import { API_BASE_URL, getWorkflow, updateWorkflow, getDye2KvArray, setDye2KvArray, getKVValue, DYE2_KV_NAMESPACE, onWorkflowUpdated, getPlugins, installPluginFromRelease, enablePlugin, checkPluginUpdates, approvePluginUpdate, persistSharedValue, FLUSH_DURATION_LAST_VALUE_KEY, HOT_WATER_VOLUME_LAST_VALUE_KEY, HOT_WATER_TEMP_LAST_VALUE_KEY, STEAM_DURATION_LAST_VALUE_KEY, STEAM_FLOW_LAST_VALUE_KEY, getProfiles } from './api.js';
+import { API_BASE_URL, getWorkflow, updateWorkflow, getDye2KvArray, setDye2KvArray, getKVValue, DYE2_KV_NAMESPACE, onWorkflowUpdated, getPlugins, installPluginFromRelease, enablePlugin, checkPluginUpdates, approvePluginUpdate, persistSharedValue, FLUSH_DURATION_LAST_VALUE_KEY, HOT_WATER_VOLUME_LAST_VALUE_KEY, HOT_WATER_TEMP_LAST_VALUE_KEY, STEAM_DURATION_LAST_VALUE_KEY, STEAM_FLOW_LAST_VALUE_KEY, MILK_STOP_LAST_VALUE_KEY, getProfiles } from './api.js';
 import { applyWorkflowToMainPageUI } from './profileManager.js';
 import { logger } from './logger.js';
 import { fitTextToBox, getTranslation } from './i18n.js';
 import { stripRightInset } from './header-strip-inset.js';
 import { openContextMenu } from './context-menu.js';
 import { setupPressAndHold, setSteamTileModeIfSafe, setHotWaterTileMode, showToast } from './ui.js';
-import { recipeIdPatch, SELECTION_KEY, RETURN_PARAM, profileFingerprint, profileDrifted, serializeSelection, resolveReturn, parseDyeReturn, changedFields, pluginRecordsDialIn, keepPreviousOnFailure, resolveRecordsDialIn, armedSelectionId, selectionModified, recipeCellState, recipeStripCells, favStripCells } from './dye-selection.js';
+import { settingsReady, SETTINGS_RESTORED_EVENT } from './settingsSync.js';
+import { DYE2_ENABLED_KEY, isDye2Enabled } from './dye2-enabled.js';
+import { recipeIdPatch, SELECTION_KEY, RETURN_PARAM, profileFingerprint, profileDrifted, profilePatchWithSteps, serializeSelection, resolveReturn, parseDyeReturn, changedFields, pluginRecordsDialIn, pluginHasEndpoint, keepPreviousOnFailure, resolveRecordsDialIn, armedSelectionId, selectionModified, recipeCellState, recipeStripCells, favStripCells } from './dye-selection.js';
 
 const AF_KEY = 'autoFavourites';
 const RECIPES_KEY = 'recipes';
@@ -34,7 +36,9 @@ const MODE_KEY = 'streamline.dyeStripMode';
 // Master on/off for the whole DYE2 header UI (set in Extensions settings).
 // DEFAULT OFF: when this is not 'true' the header is byte-identical to stock
 // Streamline (profile favourites only, no toggle / DYE button / strip).
-const ENABLED_KEY = 'streamline.dye2Enabled';
+// Defined in dye2-enabled.js so history.js can read the flag without importing
+// this module; re-exported below, so existing importers are unaffected.
+const ENABLED_KEY = DYE2_ENABLED_KEY;
 const PLUGIN_BASE = `${API_BASE_URL}/plugins/dye2.reaplugin`; // …/api/v1/plugins/dye2.reaplugin
 const MAX_FAV_CELLS = 4; // + a trailing "VIEW ALL AUTO FAV" cell
 
@@ -66,11 +70,21 @@ let activeModified = false; // DYE2 says the highlighted recipe has drifted: its
 // Does the installed DYE2 record dial-in edits itself? Re-read with the strip data
 // (a plugin update lands without a skin reload). False keeps the legacy auto-save.
 let dye2RecordsDialIn = false;
+// Does the installed DYE2 serve its recipe-library page? The "Select recipe" /
+// "Replace ..." menu items open it, and a DYE2 that never declared the endpoint
+// answers Decaid's 404 inside the overlay instead. Optimistic until a readable
+// plugin list says otherwise, so an unreachable bridge hides nothing.
+let dye2HasSelectRecipe = true;
 // DYE2 confirmed (200) the item the last apply armed, so it is the one recording and
 // the skin writes nothing. The capability flag above is only a hint read from the
 // plugin list; this is what decides who records, per apply.
 let dye2Armed = false;
 let applySeq = 0; // taps in quick succession: only the newest apply arms
+// What the header is currently showing, not what the flag says: null until the first
+// decision. disableDye2Ui() is not inert (it bumps applySeq, clears the armed item and
+// releases DYE2's selection), so it must only run when the header really is changing.
+let dye2UiOn = null;
+let restoreListenerRegistered = false;
 
 // ─── Data ────────────────────────────────────────────────────────────────────
 
@@ -88,6 +102,7 @@ export async function loadDyeStripData() {
     // initial false), so the fallback auto-save stays on: writing the same values
     // twice is recoverable, writing them nowhere is not.
     dye2RecordsDialIn = resolveRecordsDialIn(dye2RecordsDialIn, plugins, p => pluginRecordsDialIn(p, PLUGIN_ID));
+    if (plugins != null) dye2HasSelectRecipe = pluginHasEndpoint(plugins, 'select-recipe', PLUGIN_ID);
     logger.info(`dyeStrip: loaded ${favCache.length} favs, ${recipeCache.length} recipes${dye2RecordsDialIn ? ' (DYE2 records dial-in)' : ''}`);
 }
 
@@ -133,10 +148,15 @@ function openCellMenu(btn, edit, kind, item, slot) {
     openContextMenu(btn, [
         { label: getTranslation('Edit in DYE2'), onSelect: edit },
         ...(selected ? [{ label: getTranslation('Save changes'), onSelect: () => saveChanges(kind, item) }] : []),
-        // Saves the live workflow into THIS cell's slot, independent of the selection; the label
-        // names the recipe being replaced (it drops to the library, not deleted). R strip only: a
-        // new recipe is invisible from the F strip.
-        ...(kind === 'recipe' ? [{ label: `${getTranslation('Replace')} ${recipeLabel(item)}`, onSelect: () => saveToRecipes(slot) }] : []),
+        // Opens DYE2's recipe library targeted at THIS cell's slot: the barista picks a card and
+        // it is assigned to the button they long-pressed, replacing the recipe named in the label
+        // (which drops to the library, not deleted). R strip only: the F strip holds no slots.
+        ...(kind === 'recipe' && dye2HasSelectRecipe ? [{ label: `${getTranslation('Replace')} ${recipeLabel(item)}`, onSelect: () => openPluginOverlay('select-recipe', { slot }) }] : []),
+        // A favourite and a recent have no save target of their own, so keeping a dial-in from one
+        // means making a recipe of it (#159 acceptance 4). Saved to the library with no slot: it
+        // shows up as a card in DYE2's recipe list, and the barista gives it a button from there.
+        // F strip only -- a recipe cell already has "Save changes" for its own dial-in.
+        ...(kind === 'favourite' ? [{ label: getTranslation('Save to recipes'), onSelect: () => saveToRecipes(null, item.beverage) }] : []),
         { divider: true },
         { label: getTranslation('Clear button'), danger: true, onSelect: () => clearCell(kind, item) },
     ]);
@@ -218,15 +238,22 @@ async function saveChanges(kind, item, retried = false) {
 // Save what is on the machine now as a recipe in the pressed cell's slot (POST save-recipe
 // {slot}); DYE2 picks the name and demotes the slot's previous holder to the library. The 409
 // (all slots taken) cannot happen with a slot given but the route can still answer it.
-async function saveToRecipes(slot, retried = false) {
+async function saveToRecipes(slot, beverage = '', retried = false) {
     try {
         const res = await fetch(`${PLUGIN_BASE}/save-recipe`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ slot: Number(slot) }),
+            // No slot for a favourite's "Save to recipes": the recipe goes to DYE2's library, where
+            // the barista picks a button for it. explicitRecipeSlot() reads a missing slot as that.
+            // The beverage is the item's own typed field, not a workflow one, so DYE2 cannot read
+            // it back from the live workflow -- it is sent, and is the only drink word in the name.
+            body: JSON.stringify({
+                ...(slot == null ? {} : { slot: Number(slot) }),
+                ...(beverage ? { beverage } : {}),
+            }),
         });
         if (res.status === 404) { // an older DYE2 has no such endpoint
-            if (!retried && await updateDye2Now()) return saveToRecipes(slot, true);
+            if (!retried && await updateDye2Now()) return saveToRecipes(slot, beverage, true);
             showToast('Update DYE2 to save recipes', 2400, 'info');
             return;
         }
@@ -237,6 +264,9 @@ async function saveToRecipes(slot, retried = false) {
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const body = await res.json().catch(() => null);
         await loadDyeStripData().catch(e => logger.warn('dyeStrip: reload after save failed', e));
+        // save-recipe arms the new recipeId in the workflow, so the new cell is the selected one.
+        // From the derived route only -- the KV mirror may still name the item saved from.
+        await syncSelection({ mirror: false }).catch(() => {});
         if (currentMode !== 'P') renderStrip(currentMode);
         showToast(body && body.name ? `Saved as ${body.name}` : 'Saved as a recipe', 2000, 'info');
     } catch (e) {
@@ -296,6 +326,10 @@ export function renderStrip(mode) {
             }
             const active = fav.id != null && fav.id === activeItemId;
             const cell = makeCell(favLabel(fav), active ? CELL_ACTIVE : CELL_IDLE, () => {
+                // Highlighted means the live workflow already IS this favourite (the highlight is
+                // derived from it), so re-applying it would write the same values back and could
+                // undo an edit made since. The tap is inert instead (#159 acceptance 1).
+                if (active) return;
                 activeItemId = fav.id;
                 activeModified = false;
                 renderStrip('F');
@@ -317,13 +351,24 @@ export function renderStrip(mode) {
         // place, and a tap on a blank opens DYE2's recipe editor.
         recipeStripCells(recipeCache).forEach(({ slot, recipe }) => {
             if (!recipe) {
+                // Two ways to fill an empty button: pick an existing recipe from DYE2's library
+                // (the same assign flow a filled cell's "Replace" uses, which needs no recipe to
+                // already be there), or capture what is on the machine now as a new one. A tap
+                // still opens a blank recipe form on this slot.
                 strip.appendChild(makeCell('', CELL_IDLE, () => editRecipe({ id: slot, blank: true }),
-                    btn => openContextMenu(btn, [{ label: `${getTranslation('Save to recipe')} ${slot}`, onSelect: () => saveToRecipes(slot) }])));
+                    btn => openContextMenu(btn, [
+                        ...(dye2HasSelectRecipe ? [{ label: getTranslation('Select recipe'), onSelect: () => openPluginOverlay('select-recipe', { slot }) }] : []),
+                        { label: `${getTranslation('Save to recipe')} ${slot}`, onSelect: () => saveToRecipes(slot) },
+                    ])));
                 return;
             }
             const { active, marker } = recipeCellState(recipe, activeItemId, activeModified);
             const cls = active ? CELL_ACTIVE : CELL_IDLE;
             const cell = makeCell(recipeLabel(recipe) + marker, cls, () => {
+                // Inert on the highlighted cell, `*` included: a drifted recipe is still the one
+                // being dialled in, so a tap must not revert the machine to the stored values --
+                // "Save changes" or DYE2 decides what happens to the drift (#159 acceptance 1).
+                if (active) return;
                 activeItemId = recipe.id;
                 activeModified = false;
                 renderStrip('R');
@@ -474,18 +519,21 @@ export async function applyRecipe(recipe) {
 // Resolve `stub` (an { id, title } thin reference, an id string, or an
 // already-full Profile) to the full Profile object (steps included) via
 // GET /profiles, so callers can PUT the real thing. Returns null (never
-// throws) when the id can't be resolved -- an ad-hoc/deleted profile with no
-// library record has nothing else to load; callers fall back to the thin
-// stub and a warning is logged.
+// throws) when there is nothing to resolve it from -- an ad-hoc profile with no
+// library record -- and the caller then leaves the loaded profile alone.
 async function resolveFullProfile(stub) {
     if (!stub) return null;
-    const id = typeof stub === 'string' ? stub : stub.id;
-    if (!id) return null;
+    // Before the id guard below, not after: a DYE2 row that captured the whole
+    // profile stores Decaid's `workflow.profile`, which carries no id at all, so
+    // reading the id first threw away every fully-captured recipe.
+    //
     // steps.length, not just Array.isArray: older DYE2 rows store the profile as
     // { id, title, steps: [] }, and treating that as full PUTs a profile with no steps --
     // the live curve keeps running under the recipe's name, which reads as "the recipe did
     // not load". An empty array means the steps were never captured, so resolve by id.
-    if (typeof stub === 'object' && Array.isArray(stub.steps) && stub.steps.length) return stub; // already full
+    if (typeof stub === 'object' && profilePatchWithSteps(stub)) return stub; // already full
+    const id = typeof stub === 'string' ? stub : stub.id;
+    if (!id) return null;
     try {
         const records = await getProfiles();
         const record = Array.isArray(records) ? records.find(r => r && r.id === id) : null;
@@ -493,15 +541,16 @@ async function resolveFullProfile(stub) {
     } catch (e) {
         logger.warn(`resolveFullProfile: failed to fetch profiles while resolving ${id}`, e);
     }
-    logger.warn(`resolveFullProfile: could not resolve profile ${id} to a full record (deleted/ad-hoc profile?) — applying id/title only, brew steps will not change`);
+    logger.warn(`resolveFullProfile: could not resolve profile ${id} to a full record (purged/ad-hoc profile?) — the loaded profile is left alone`);
     return null;
 }
 
 // The stored `workflow` is a ready-to-PUT { context, profile? }. Merge its context
 // over the live context (preserving fields it doesn't set) and its profile if any.
-// The profile is resolved to its full record as a backstop regardless of what
-// shape was actually stored (older KV items may still carry the legacy thin
-// { id, title } stub — see resolveFullProfile).
+// The profile is resolved to its full record regardless of what shape was
+// actually stored (older KV items may still carry the legacy thin { id, title }
+// stub — see resolveFullProfile), and is left out of the patch when it cannot
+// be resolved.
 // Fold a context fragment into a patch, keeping `extras` a merge rather than a
 // replace: the legacy paths may already have put rpm or note there.
 function mergeContext(patch, fragment) {
@@ -519,7 +568,10 @@ async function applyStoredWorkflow(workflow) {
     const patch = {};
     if (workflow.context) patch.context = { ...workflow.context };
     if (workflow.profile) {
-        patch.profile = (await resolveFullProfile(workflow.profile)) || workflow.profile;
+        // Never the stored stub as a fallback -- see profilePatchWithSteps. An
+        // unresolvable profile leaves the loaded one alone, name included.
+        const full = profilePatchWithSteps(await resolveFullProfile(workflow.profile));
+        if (full) patch.profile = full;
     }
     return patch;
 }
@@ -555,12 +607,12 @@ async function applyFavLegacy(fav) {
     if (on('note') && snp.note) ctx.extras = { ...(ctx.extras || {}), note: snp.note };
     const patch = Object.keys(ctx).length ? { context: ctx } : {};
     if (on('profile') && (snp.profileId || snp.profileTitle)) {
-        if (snp.profileSnapshot && Array.isArray(snp.profileSnapshot.steps)) {
-            patch.profile = snp.profileSnapshot;
-        } else {
-            const full = snp.profileId ? await resolveFullProfile(snp.profileId) : null;
-            patch.profile = full || { id: snp.profileId, title: snp.profileTitle };
-        }
+        // Snapshot first, the stored id second, and nothing at all if neither
+        // yields steps -- a title-only patch renames the loaded profile instead
+        // of replacing it (see profilePatchWithSteps).
+        const full = profilePatchWithSteps(snp.profileSnapshot)
+            || profilePatchWithSteps(snp.profileId ? await resolveFullProfile(snp.profileId) : null);
+        if (full) patch.profile = full;
     }
     return patch;
 }
@@ -580,12 +632,10 @@ async function applyRecipeLegacy(recipe) {
     if (recipe.drinker) ctx.drinkerName = recipe.drinker;
     const patch = Object.keys(ctx).length ? { context: ctx } : {};
     if (recipe.profileId || recipe.profileTitle) {
-        if (recipe.profileSnapshot && Array.isArray(recipe.profileSnapshot.steps)) {
-            patch.profile = recipe.profileSnapshot;
-        } else {
-            const full = recipe.profileId ? await resolveFullProfile(recipe.profileId) : null;
-            patch.profile = full || { id: recipe.profileId, title: recipe.profileTitle };
-        }
+        // Same as applyFavLegacy: no steps, no profile in the patch.
+        const full = profilePatchWithSteps(recipe.profileSnapshot)
+            || profilePatchWithSteps(recipe.profileId ? await resolveFullProfile(recipe.profileId) : null);
+        if (full) patch.profile = full;
     }
     return patch;
 }
@@ -614,17 +664,34 @@ async function mergeRecipeLiveSettings(dv) {
         steam.flow = dv.steamFlowMls;
         await persistSharedValue(STEAM_FLOW_LAST_VALUE_KEY, dv.steamFlowMls);
     }
+    // Not gated on steamMode: that is the display hint for the time/flow pair
+    // and says nothing about the stop. Remembered only while armed, the rule
+    // api.setStopAtTemperature applies -- a 0 means the stop is off, and
+    // persisting it would erase the temperature the user tuned.
+    if (dv.steamStopAtTempC != null) {
+        steam.stopAtTemperature = dv.steamStopAtTempC;
+        if (dv.steamStopAtTempC > 0) await persistSharedValue(MILK_STOP_LAST_VALUE_KEY, dv.steamStopAtTempC);
+    }
     if (Object.keys(steam).length) patch.steamSettings = steam;
 
+    // Applied on presence, not on hotWaterMode: the mode only says which of the
+    // pair the recipe editor showed, and gating on it dropped every other
+    // setting the recipe held. DYE2's own apply does the same (plugin.js
+    // RECIPE_MACHINE_FIELDS: "apply writes every setting held, not just the
+    // active mode's").
     const water = {};
-    if (dv.hotWaterMode === 'vol' && dv.hotWaterMl != null) {
+    if (dv.hotWaterMl != null) {
         water.volume = dv.hotWaterMl;
         await persistSharedValue(HOT_WATER_VOLUME_LAST_VALUE_KEY, dv.hotWaterMl);
     }
-    if (dv.hotWaterMode === 'temp' && dv.hotWaterTempC != null) {
+    if (dv.hotWaterTempC != null) {
         water.targetTemperature = dv.hotWaterTempC;
         await persistSharedValue(HOT_WATER_TEMP_LAST_VALUE_KEY, dv.hotWaterTempC);
     }
+    // No main-page tile and no last-* key of their own; held by the recipe
+    // editor, so applying the recipe must still put them on the machine.
+    if (dv.hotWaterTimeS != null) water.duration = dv.hotWaterTimeS;
+    if (dv.hotWaterFlowMls != null) water.flow = dv.hotWaterFlowMls;
     if (Object.keys(water).length) patch.hotWaterData = water;
 
     if (dv.flushS != null) {
@@ -695,7 +762,12 @@ function isSameOrigin(url) {
 
 // `params` adds query params (e.g. { id }) next to `return`. They travel in the URL because
 // sessionStorage is per-origin: in the cross-origin fallback below DYE2 cannot see ours.
-export function openPluginOverlay(page, params) {
+// `onClose(refresh)` runs when the overlay goes away: `refresh` is true when the plugin
+// navigated back to the sentinel return URL (it saved/deleted something), false for the
+// skin's own Close button. Only the caller that needs a repaint passes one.
+let overlayCloseHook = null;
+export function openPluginOverlay(page, params, onClose) {
+    overlayCloseHook = typeof onClose === 'function' ? onClose : null;
     const pluginUrl = `${PLUGIN_BASE}/${page}`;
     const query = (returnTo) => {
         const q = new URLSearchParams({ return: returnTo });
@@ -730,17 +802,22 @@ export function openPluginOverlay(page, params) {
         close.textContent = 'Close';
         close.style.cssText =
             'padding:8px 22px;border:2px solid var(--mimoja-blue-v2);color:var(--mimoja-blue-v2);border-radius:20px;font-weight:600;font-size:20px;cursor:pointer;';
-        close.addEventListener('click', closePluginOverlay);
+        close.addEventListener('click', () => closePluginOverlay(false));
         bar.appendChild(close);
         const frame = document.createElement('iframe');
         frame.id = 'dye-plugin-frame';
         frame.style.cssText = 'flex:1;width:100%;border:0;';
         // Same-origin load handler: when the plugin navigates back to our sentinel
-        // return URL, tear down the overlay and refresh the strip + controls.
+        // return URL, tear down the overlay and refresh the strip + controls. The plugin
+        // adds `dyeShot=<id>` for the shot it was showing on the way out (it may have moved
+        // off the one we opened), so the caller repaints the right row.
         frame.addEventListener('load', () => {
             let href = '';
             try { href = frame.contentWindow.location.href; } catch (e) { return; } // cross-origin, ignore
-            if (href.includes('dyeReturn=1')) closePluginOverlay(true);
+            if (!href.includes('dyeReturn=1')) return;
+            let editedShotId = null;
+            try { editedShotId = new URL(href).searchParams.get('dyeShot'); } catch (e) { /* ignore */ }
+            closePluginOverlay(true, editedShotId);
         });
         overlay.appendChild(bar);
         overlay.appendChild(frame);
@@ -751,13 +828,18 @@ export function openPluginOverlay(page, params) {
     overlay.style.display = 'flex';
 }
 
-function closePluginOverlay(refresh) {
+function closePluginOverlay(refresh, editedShotId) {
     const overlay = document.getElementById('dye-plugin-overlay');
     if (overlay) overlay.style.display = 'none';
+    const hook = overlayCloseHook;
+    overlayCloseHook = null;
     if (refresh) {
         // DYE2 may have applied a fav/recipe or edited the collections while open.
         loadDyeStripData().then(() => { if (currentMode !== 'P') renderStrip(currentMode); }).catch(() => {});
         refreshAfterApply();
+    }
+    if (hook) {
+        try { hook(!!refresh, editedShotId || null); } catch (e) { logger.warn('plugin overlay close hook failed', e); }
     }
 }
 
@@ -794,6 +876,28 @@ function editFavourite(fav) {
     if (fav.id == null) { openPluginOverlay('auto-favs'); return; }
     try { sessionStorage.setItem('dye_editAutoFavId', String(fav.id)); } catch (e) { /* private mode */ }
     openPluginOverlay('auto-fav-edit');
+}
+
+// Where the Grind label goes while DYE2 is on, which is wherever the grinder is
+// recorded for what the barista is making. An armed recipe or favourite carries
+// its own grinder, and changing it there is the point: a recipe is its dial-in,
+// so a different grinder is a different recipe, and DYE2's own editor says so
+// (recipe-edit re-applies the recipe on save, so the new grinder reaches the
+// live workflow too). With nothing armed there is no item to edit and the
+// grinder belongs to the next shot alone: DYE2's grinder-picker writes it
+// straight onto the workflow.
+export async function openGrinderSurface() {
+    // activeItemId is a highlight, and in P mode nothing has refreshed it since boot
+    // (setStripMode only syncs on F/R): a recipe armed inside DYE2 would look like
+    // nothing armed, and the picker would write the workflow instead of the recipe.
+    // A no-op against a DYE2 that does not record its own dial-in.
+    await syncSelection().catch(() => {});
+    if (activeItemId == null) { openPluginOverlay('grinder-picker'); return; }
+    const recipe = recipeCache.find(r => r && r.id === activeItemId);
+    if (recipe) { editRecipe(recipe); return; }
+    const fav = favCache.find(f => f && f.id === activeItemId);
+    if (fav) { editFavourite(fav); return; }
+    openPluginOverlay('grinder-picker');
 }
 
 // ─── Plugin install / version state ───────────────────────────────────────────
@@ -1143,9 +1247,7 @@ function clearStripBounds() {
 
 // ─── Master enable/disable (gates the whole DYE2 header UI) ─────────────────────
 
-export function isDye2Enabled() {
-    try { return localStorage.getItem(ENABLED_KEY) === 'true'; } catch (e) { return false; }
-}
+export { isDye2Enabled };
 
 let wired = false; // one-time listener wiring, so re-enabling doesn't double-bind
 
@@ -1202,6 +1304,7 @@ function wireOnce() {
 // Reveal the DYE2 UI: shift the profile nav right to make room, show the toggle +
 // DYE button, wire listeners, load KV data, restore the saved P/F/R mode.
 export async function enableDye2Ui() {
+    dye2UiOn = true;
     const profileNav = document.getElementById('profile-fav-nav');
     const toggle = document.getElementById('dye-strip-toggle');
     const dyeBtn = document.getElementById('dye-open-btn');
@@ -1220,6 +1323,7 @@ export async function enableDye2Ui() {
 // Restore the stock header: hide the toggle + DYE button + strip and move the
 // profile nav back to its original position (byte-identical to stock Streamline).
 export function disableDye2Ui() {
+    dye2UiOn = false;
     applySeq++; // drop any arm still retrying in the background
     clearActiveItem();
     // DYE2 keeps recording against what it has armed whatever the header shows, so a
@@ -1386,13 +1490,26 @@ export function recipeAutoSaveFields(dataToSend, workflow) {
     } else if (steam.flow != null) {
         patch.steamMode = 'flow';
         patch.steamFlowMls = workflow?.steamSettings?.flow ?? steam.flow;
-    } // stopAtTemperature (milk) / auto-steam fields: no recipe equivalent -- skip.
+    }
+    // The milk auto-stop is its own field, not one of the time/flow pair:
+    // steamMode has no 'milk' value (it only names which of the pair the recipe
+    // editor shows), so the stop is recorded without touching it. DYE2's recipe
+    // editor has had a Milk stop control since dye2 6aec7f3; 0 is a real value
+    // there, meaning the stop is off.
+    if (steam.stopAtTemperature != null) {
+        patch.steamStopAtTempC = workflow?.steamSettings?.stopAtTemperature ?? steam.stopAtTemperature;
+    }
+    // Volume and temperature are recorded independently -- one write can carry
+    // both, and an either/or dropped the second one. steamMode's sibling
+    // hotWaterMode is still just the display hint, so it follows whichever the
+    // edit led with.
     const hw = dataToSend.hotWaterData || {};
     if (hw.volume != null) {
         patch.hotWaterMode = 'vol';
         patch.hotWaterMl = workflow?.hotWaterData?.volume ?? hw.volume;
-    } else if (hw.targetTemperature != null) {
-        patch.hotWaterMode = 'temp';
+    }
+    if (hw.targetTemperature != null) {
+        if (patch.hotWaterMode === undefined) patch.hotWaterMode = 'temp';
         patch.hotWaterTempC = workflow?.hotWaterData?.targetTemperature ?? hw.targetTemperature;
     }
     const rinse = dataToSend.rinseData || {};
@@ -1544,6 +1661,16 @@ async function foldWorkflowIntoItem(item, workflow) {
 
 let workflowListenerRegistered = false;
 
+// Show or hide the DYE2 header surfaces, but only on a real change -- see dye2UiOn. The flag
+// is set here rather than left to the two functions below, so the decision does not depend on
+// a side effect of what it calls; they set it too, for a caller that reaches them directly
+// (window.applyDye2Enabled, from the Extensions toggle).
+async function applyDye2Ui(on) {
+    if (on === dye2UiOn) return;
+    dye2UiOn = on;
+    if (on) await enableDye2Ui(); else disableDye2Ui();
+}
+
 export async function initDyeStrip() {
     // Bridge for the Extensions-settings toggle to flip the header live (the header
     // stays in the DOM behind the settings overlay); if it isn't present the flag
@@ -1555,10 +1682,25 @@ export async function initDyeStrip() {
         onWorkflowUpdated(handleWorkflowUpdatedForAutoSave);
     }
 
-    if (isDye2Enabled()) {
-        await enableDye2Ui();
-        await restoreParkedSelection().catch(e => logger.warn('dyeStrip: could not restore selection', e));
-    } else {
-        disableDye2Ui();
+    // settingsReady resolves either way, so a Decaid that is not listening yet leaves the
+    // flag unhydrated and hands the real value over later, through the retry ladder's restore
+    // event (settingsSync's `boot`). Registered BEFORE the await: the on-time hydrate
+    // dispatches the event while settingsReady is still pending.
+    if (!restoreListenerRegistered) {
+        restoreListenerRegistered = true;
+        window.addEventListener(SETTINGS_RESTORED_EVENT, event => {
+            if (!(ENABLED_KEY in (event.detail || {}))) return;
+            applyDye2Ui(isDye2Enabled()).catch(e => logger.warn('dyeStrip: late enable failed', e));
+        });
     }
+
+    // This flag is synchronized, and reading it before settingsSync has hydrated answers with
+    // the DEFAULT (off). Nothing repainted it afterwards, so a second client -- or any client
+    // after an app update, since WebView storage does not survive one -- lost the DYE button
+    // for the whole session while Settings showed the extension enabled (#168).
+    await settingsReady;
+
+    const on = isDye2Enabled();
+    await applyDye2Ui(on);
+    if (on) await restoreParkedSelection().catch(e => logger.warn('dyeStrip: could not restore selection', e));
 }

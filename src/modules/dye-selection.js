@@ -19,6 +19,20 @@ export const SELECTION_KEY = 'streamline.dyeSelection';
 // and immediately clear the item auto-save is running for. The same goes for
 // target_weight / target_volume: the dashboard folds the yield into them, so a
 // yield change is dial-in, not a new profile (#147).
+// JSON.stringify calls the replacer again on whatever object IT returns, not the original,
+// so returning a key-sorted copy at every level makes the whole tree order-independent --
+// two profiles equal in content but not in key order (dye2#43: Decent Sync's jsonb storage
+// reorders keys, shorter first; Decaid's own toJson order is whatever Workflow wrote) now
+// fingerprint the same.
+function sortKeysReplacer(_key, value) {
+    if (value && typeof value === 'object' && !Array.isArray(value)) {
+        const sorted = {};
+        for (const k of Object.keys(value).sort()) sorted[k] = value[k];
+        return sorted;
+    }
+    return value;
+}
+
 export function profileFingerprint(profile) {
     if (!profile) return null;
     const steps = Array.isArray(profile.steps)
@@ -32,7 +46,7 @@ export function profileFingerprint(profile) {
         title: profile.title,
         tank_temperature: profile.tank_temperature,
         steps,
-    });
+    }, sortKeysReplacer);
 }
 
 /** Has the live workflow's profile moved away from the one `item` was armed on? */
@@ -150,9 +164,22 @@ export function changedFields(patch, stored) {
 // auto-save in dyeStrip.js stays the only way its items follow the dashboard.
 // The endpoint list comes from GET /api/v1/plugins, which the strip already reads.
 export function pluginRecordsDialIn(plugins, pluginId = 'dye2.reaplugin') {
+    return pluginHasEndpoint(plugins, 'selection', pluginId);
+}
+
+/**
+ * Does the installed plugin serve this http endpoint?
+ *
+ * DYE2's pages ARE api endpoints (Decaid plugins_handler: an endpoint the
+ * manifest does not declare answers 404 `endpoint <id> not available`), so a
+ * menu item that opens one the installed build has never heard of lands the
+ * barista on that error inside the overlay. The manifest's endpoint list comes
+ * with GET /api/v1/plugins, which the strip already reads.
+ */
+export function pluginHasEndpoint(plugins, endpoint, pluginId = 'dye2.reaplugin') {
     const plugin = Array.isArray(plugins) ? plugins.find(p => p?.id === pluginId) : null;
     if (!plugin?.loaded || !Array.isArray(plugin.api)) return false;
-    return plugin.api.some(e => e?.type === 'http' && e?.id === 'selection');
+    return plugin.api.some(e => e?.type === 'http' && e?.id === endpoint);
 }
 
 /**
@@ -170,16 +197,28 @@ export function armedSelectionId(sel, { recipes, favs }) {
 }
 
 /**
- * The steam temperature the selected DYE2 recipe wants, or null. Used when steam
- * is re-armed from off so the recipe's temperature wins over the remembered one.
- * Below 135C the machine treats the target as off, so such values are ignored.
+ * The steam settings the selected DYE2 recipe wants, each null when the recipe
+ * does not carry it. Used when steam is re-armed from off so the recipe wins
+ * over the remembered values, per field (dye2 KV_CONTRACT: steamTempC /
+ * steamTimeS / steamFlowMls, all optional on a recipe).
+ *
+ * Below 135C the machine treats the target as off, so such temperatures are
+ * ignored rather than re-arming the heater to a value that means off.
  */
-export function selectedRecipeSteamTemp(sel, recipes) {
-    if (!sel || sel.kind !== 'recipe' || sel.id == null || !Array.isArray(recipes)) return null;
-    const recipe = recipes.find(r => r && String(r.id) === String(sel.id));
-    const t = Number(recipe?.dashboardVariables?.steamTempC);
-    return Number.isFinite(t) && t >= 135 ? Math.round(t) : null;
+export function selectedRecipeSteam(sel, recipes) {
+    const empty = { tempC: null, durationS: null, flow: null };
+    if (!sel || sel.kind !== 'recipe' || sel.id == null || !Array.isArray(recipes)) return empty;
+    const vars = recipes.find(r => r && String(r.id) === String(sel.id))?.dashboardVariables;
+    if (!vars) return empty;
+    const positive = (v) => (Number.isFinite(Number(v)) && Number(v) > 0 ? Number(v) : null);
+    const t = Number(vars.steamTempC);
+    return {
+        tempC: Number.isFinite(t) && t >= 135 ? Math.round(t) : null,
+        durationS: positive(vars.steamTimeS),
+        flow: positive(vars.steamFlowMls),
+    };
 }
+
 
 /**
  * The R strip as fixed positional slots, like the profile strip. DYE2 recipe ids are
@@ -189,6 +228,9 @@ export function selectedRecipeSteamTemp(sel, recipes) {
  * place; nothing shifts left. The first row for a slot wins. There is no "strays fill
  * the blanks" step in this mode: DYE2 guarantees one recipe per slot, and a null slot
  * means "not on the strip", so back-filling would put library rows on it.
+ *
+ * A cell a clear emptied is not a free blank even where back-filling does apply: the
+ * cleared button must stay empty, not be handed to the next recipe in line.
  *
  * Compat: a DYE2 older than stripSlot writes no `stripSlot` key on any row and uses
  * ids '1'..'5' as the slots. When no row carries the key at all, the old id-based
@@ -202,6 +244,15 @@ export function recipeStripCells(recipes, count = 5) {
     const rows = (Array.isArray(recipes) ? recipes : []).filter(r => r && typeof r === 'object');
     const visible = rows.filter(r => r.showOnStreamlineDashboard !== false);
     const legacy = !rows.some(r => r.stripSlot !== undefined);
+    // Legacy placement is by id, so that is where a cleared row's cell comes from. Modern
+    // placement back-fills nothing, so it needs no reservation.
+    const idCell = recipe => {
+        const n = parseInt(recipe.id, 10);
+        return String(recipe.id) === String(n) && n >= 1 && n <= count ? n - 1 : null;
+    };
+    const clearedCells = new Set(legacy
+        ? rows.filter(r => r.showOnStreamlineDashboard === false).map(idCell).filter(i => i !== null)
+        : []);
     const strays = [];
     for (const recipe of visible) {
         let cell;
@@ -216,7 +267,7 @@ export function recipeStripCells(recipes, count = 5) {
         if (cell && !cell.recipe) cell.recipe = recipe;
     }
     for (const recipe of strays) {
-        const blank = cells.find(c => !c.recipe);
+        const blank = cells.find((c, i) => !c.recipe && !clearedCells.has(i));
         if (!blank) break;
         blank.recipe = recipe;
     }
@@ -319,4 +370,21 @@ export function resolveRecordsDialIn(previous, plugins, derive) {
  */
 export function recipeIdPatch(id) {
     return { extras: { dye: { v: 1, recipeId: id == null ? null : String(id) } } };
+}
+
+/**
+ * The profile a workflow patch may carry, or null when there is none to send.
+ *
+ * PUT /workflow deep-merges (Decaid json_utils.deepMergeJson), so a profile
+ * object without steps does not replace the loaded profile -- it *renames* it.
+ * The machine keeps running the previous curve, the dashboard shows the item's
+ * name over it, and the shot record is saved under that name with the other
+ * profile's steps, notes and author. DYE2 stores exactly such stubs: a thin
+ * `{ id, title }`, an older row's `{ id, title, steps: [] }`, and sometimes a
+ * bare `{}`. A profile that cannot be resolved to its full record must drop out
+ * of the patch entirely instead.
+ */
+export function profilePatchWithSteps(profile) {
+    const steps = profile && profile.steps;
+    return Array.isArray(steps) && steps.length ? profile : null;
 }

@@ -14,6 +14,9 @@ import { ASSISTED_DIALIN_PLUGIN_ID, findAssistedDialInPlugin, buildAssistedDialI
 import { openBeanScaleCaptureModal } from './bean-scale-modal.js';
 import { openBeanSelectionModal } from './bean-selection-modal.js';
 import { VISUALIZER_PLUGIN_ID, visualizerAccountConfigured } from './visualizer-account.js';
+// Gate only -- the 90K dyeStrip.js that owns openPluginOverlay is imported at
+// tap time below, so it stays off the boot graph.
+import { isDye2Enabled } from './dye2-enabled.js';
 
 const PAGE_SIZE = 20;
 let shots = [];
@@ -261,6 +264,35 @@ export function refreshCurrentShot() {
     }
 }
 
+// After DYE2's edit-shot page closes, bring just that shot up to date instead of
+// reloading the whole window (the user may be pages deep in history). A 404 is a
+// delete made there; anything else is the saved record, whose profile/dose/grind
+// this panel shows. Keeps the selected position, so returning lands where they left.
+export async function refreshShotAfterDye2Edit(id) {
+    if (!id) return;
+    const response = await fetch(`${API_BASE_URL}/shots/${id}`);
+    if (response.status === 404) {
+        await idbDeleteShot(id);
+        shots = historyPager.remove(id);
+        if (shots.length === 0) {
+            chart.clearChart();
+            clearShotData();
+            document.getElementById('history-prev-btn')?.classList.add('invisible');
+            document.getElementById('history-next-btn')?.classList.add('invisible');
+        } else {
+            await displayShot(Math.min(currentShotIndex, shots.length - 1));
+        }
+        return;
+    }
+    if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
+    const updated = await response.json();
+    const index = shots.findIndex(shot => shot.id === id);
+    if (index === -1) return;
+    shots = historyPager.update({ ...shots[index], ...updated });
+    await addShots([shots.find(shot => shot.id === id)]);
+    await displayShot(shots.findIndex(shot => shot.id === id));
+}
+
 // Ensure the current shot has its measurements loaded (the list endpoint
 // strips them; the summary needs the full record).
 async function ensureCurrentShotMeasurements() {
@@ -356,6 +388,34 @@ function refreshVisualizerAvailability() {
         .catch(() => { visualizerLoggedIn = false; }); // not installed, or unreachable
 }
 
+// The four text lines are the only tap target: DYE2's edit page opens from them, while
+// the block around them is layout and the arrows keep their own buttons.
+const SHOT_HISTORY_EDIT_TAP_SELECTOR =
+    '#history-date, #history-profile-name, #history-dose-in, #history-grind-size';
+
+// Tap a shot-history text line -> DYE2's edit-shot page for the shot on screen.
+// Gated on the DYE2 master switch, so with DYE2 off the panel keeps its long-press
+// menu only. DYE2 saves/deletes and comes back through the overlay's `return` URL;
+// the close hook then repaints this panel with whatever actually landed on the bridge.
+async function openShotInDye2() {
+    if (!isDye2Enabled()) return;
+    const shot = shots[currentShotIndex];
+    if (!shot?.id) {
+        showToast(getTranslation('No shot selected'), 2400, 'warning');
+        return;
+    }
+    // ponytail: imported here, not at module scope -- this is dyeStrip.js's only
+    // use on the main page, and the gate above already proved DYE2 is on.
+    const { openPluginOverlay } = await import('./dyeStrip.js');
+    openPluginOverlay('edit-shot', { shotId: shot.id }, (refresh, editedShotId) => {
+        if (!refresh) return;
+        // DYE2 hands back the shot it was showing on the way out: the arrows may have
+        // moved it off the one we opened, so refresh that row, not our opening shot.
+        refreshShotAfterDye2Edit(editedShotId || shot.id).catch(error =>
+            logger.warn('Could not repaint the shot after editing it in DYE2:', error));
+    });
+}
+
 function setupHistoryLongPress() {
     const panel = document.getElementById('shot-history-panel');
     if (!panel) return;
@@ -371,7 +431,15 @@ function setupHistoryLongPress() {
 
     refreshDialInAvailability();
     refreshVisualizerAvailability();
-    setupPressAndHold(panel, () => {}, () => {
+    setupPressAndHold(panel, (event) => {
+        // Only the four info lines open DYE2: an arrow tap bubbles here too, and the
+        // block's own padding is not a control. A long press is swallowed by
+        // setupPressAndHold.
+        if (!event?.target?.closest?.(SHOT_HISTORY_EDIT_TAP_SELECTOR)) return;
+        // Async now that dyeStrip.js loads on demand: catch, or a failed import
+        // surfaces as an unhandled rejection instead of a log line.
+        openShotInDye2().catch(error => logger.warn('Could not open the shot in DYE2:', error));
+    }, () => {
         // Dial-in entries only appear when the plugin is installed and loaded, so
         // nobody taps one just to get a "not installed" toast. Uses the cached
         // answer so the menu opens instantly; the refresh catches installs for next time.
