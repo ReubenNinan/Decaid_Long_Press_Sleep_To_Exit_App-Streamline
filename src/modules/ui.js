@@ -4,7 +4,7 @@ import { getProfile, getWorkflow, updateWorkflow, setMachineState, setTargetHotW
 import { resolveStatusStateKey, isActionTailSubstate } from './machine-status-policy.js';
 import { openDB, getSetting } from './idb.js';
 import { SCREENSAVER_CLOCK_FORMATS, SCREENSAVER_CLOCK_POSITIONS, SCREENSAVER_DATE_FORMATS, formatScreensaverClockDate, formatScreensaverClockTime, screensaverClockPositionStyle } from './screensaver-clock.js';
-import { deriveSleepButtonAction, isWakePending, mayTapWakeMachine, shouldExitAfterSleep, deriveReturnWake, SLEEP_EXIT_HOLD_MS } from './screensaver-policy.js';
+import { deriveSleepButtonAction, isWakePending, mayTapWakeMachine, shouldExitAfterSleep, deriveReturnWake, exitDidNotLeave, setScreensaverSuppressed, EXIT_CHECK_MS, SLEEP_EXIT_HOLD_MS } from './screensaver-policy.js';
 import { isBengleMachine, isBengleModel } from './machine.js';
 import { STEAM_FLOW_PRESETS_BY_MODEL, MILK_STOP_PRESETS, resolveSteamFlowPresetsForModel, resolveSteamTileMode, steamSlotField as resolveSteamSlotField, milkTelemetryValue, steamFlowHighlightIndex, STEAM_SYNC_SYNCED, steamSyncField, foldSteamSyncState, shouldRetrySteamSync, steamSyncRetryDelay } from './steam-mode.js';
 import { API_DEBOUNCE_MS } from './workflow-watch.js';
@@ -2046,42 +2046,98 @@ export function wakeFromScreensaver() {
 }
 
 // Long-press Sleep left the app; the next return to it wakes the machine.
-let exitedForSleepAt = 0;
-let hiddenSinceExit = false;
+//
+// The marker lives in localStorage, not memory: after ten minutes in the
+// background Decaid unloads the page and reloads it on return, and Android may
+// close the app altogether. Either way the reloaded page still wakes the machine,
+// as reopening the de1app did.
+//
+// From the exit until the return, the screensaver and panel dim are suppressed:
+// the machine confirms the sleep while the app is leaving, and an overlay raised
+// then is the first thing shown on return, for a moment, before the wake.
+const SLEEP_EXIT_KEY = 'sleepExitPending';
 let returnWakeInstalled = false;
+
+function readSleepExit() {
+    try {
+        const exit = JSON.parse(localStorage.getItem(SLEEP_EXIT_KEY) || 'null');
+        return exit && exit.at ? exit : null;
+    } catch {
+        return null;
+    }
+}
+
+function writeSleepExit(exit) {
+    try {
+        if (exit) localStorage.setItem(SLEEP_EXIT_KEY, JSON.stringify(exit));
+        else localStorage.removeItem(SLEEP_EXIT_KEY);
+    } catch {
+        // Storage unavailable: the in-page path below still covers a short absence.
+    }
+}
+
+// Suppress before the first machine snapshot can raise the overlay on a reload.
+if (readSleepExit()) setScreensaverSuppressed(true);
+
+function noteSleepExit() {
+    if (screensaverActive) hideScreensaver(); // PURE UI -- the sleep may already be confirmed
+    setScreensaverSuppressed(true);
+    writeSleepExit({ at: Date.now(), hidden: false });
+    setTimeout(() => {
+        const exit = readSleepExit();
+        if (!exitDidNotLeave({ exitedAt: exit?.at, wentHidden: !!exit?.hidden })) return;
+        // Still on screen: no return to wait for, so let the overlay follow the
+        // machine again.
+        writeSleepExit(null);
+        setScreensaverSuppressed(false);
+    }, EXIT_CHECK_MS);
+}
+
+function wakeOnReturn() {
+    const exit = readSleepExit();
+    if (!exit) return;
+    const decision = deriveReturnWake({
+        exitedAt: exit.at,
+        wentHidden: !!exit.hidden,
+        machineState: currentMachineState,
+    });
+    logger.warn(`[exit-test] return decision=${decision} state=${currentMachineState} hidden=${!!exit.hidden} awayMs=${Date.now() - exit.at}`);
+    if (decision === 'wait') return;
+    writeSleepExit(null);
+    if (decision === 'wake') {
+        // The same wake as a tap on the screensaver: suppress the stale 'sleeping'
+        // frames still in flight, then send the one wake command.
+        if (screensaverActive) hideScreensaver();
+        noteWakeRequested();
+    }
+    setScreensaverSuppressed(false);
+    if (decision !== 'wake') return;
+    setMachineState('idle').catch((err) => {
+        logger.error('Return to app: failed to wake the machine:', err);
+        clearWakeRequest();
+    });
+}
 
 function installReturnWake() {
     if (returnWakeInstalled) return;
     returnWakeInstalled = true;
-    const onReturn = () => {
-        const decision = deriveReturnWake({
-            exitedAt: exitedForSleepAt,
-            wentHidden: hiddenSinceExit,
-            machineState: currentMachineState,
-        });
-        if (decision === 'wait') return;
-        exitedForSleepAt = 0;
-        hiddenSinceExit = false;
-        if (decision === 'skip') return;
-        logger.warn(`[exit-test] returned to the app; waking (state=${currentMachineState})`);
-        // The same wake as a tap on the screensaver: hide it, suppress the stale
-        // 'sleeping' frames still in flight, and send the one wake command.
-        if (screensaverActive) hideScreensaver();
-        noteWakeRequested();
-        setMachineState('idle').catch((err) => {
-            logger.error('Return to app: failed to wake the machine:', err);
-            clearWakeRequest();
-        });
-    };
     document.addEventListener('visibilitychange', () => {
         if (document.visibilityState === 'hidden') {
-            if (exitedForSleepAt) hiddenSinceExit = true;
+            const exit = readSleepExit();
+            if (exit && !exit.hidden) writeSleepExit({ ...exit, hidden: true });
             return;
         }
-        onReturn();
+        wakeOnReturn();
     });
-    window.addEventListener('focus', onReturn);
-    window.addEventListener('pageshow', onReturn);
+    window.addEventListener('focus', wakeOnReturn);
+    window.addEventListener('pageshow', wakeOnReturn);
+    // A page loaded with the marker set is itself the return (Decaid reloaded it,
+    // or the app was restarted).
+    const exit = readSleepExit();
+    if (exit) {
+        writeSleepExit({ ...exit, hidden: true });
+        wakeOnReturn();
+    }
 }
 
 /** We have asked the machine to wake and are waiting for it to confirm. */
@@ -2631,8 +2687,7 @@ export function initUI(callbacks) {
                 if (exitApp) logger.warn(`[exit-test] sleep accepted; command=${action.command} host=${!!window.__DECENT_HOST__} decentApp=${window.decentApp ? Object.keys(window.decentApp).join(',') : 'none'} page=${location.href}`);
                 if (exitApp && shouldExitAfterSleep(action, window.decentApp)) {
                     logger.warn('[exit-test] calling decentApp.exitApp()');
-                    exitedForSleepAt = Date.now();
-                    hiddenSinceExit = false;
+                    noteSleepExit();
                     window.decentApp.exitApp();
                 }
             } catch (err) {

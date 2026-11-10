@@ -128,8 +128,8 @@ index 56e64e5..195620a 100644
 From 59499ab72ff2aba9595e43c4e7b7349a806f2bff Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Tue, 10 Nov 2026 02:25:11 +0000
-Subject: [PATCH] Wake the machine when returning to the app after a long-press
- exit
+Subject: [PATCH 1/2] Wake the machine when returning to the app after a
+ long-press exit
 
 The de1app woke the machine when it was reopened. After a long-press
 Sleep exit, the next return to the page (visibilitychange, focus or
@@ -311,6 +311,237 @@ index 195620a..fd77132 100644
 +    assert.equal(deriveReturnWake({ exitedAt: now - 200, wentHidden: false, machineState: 'sleeping', now }), 'wait');
 +    assert.equal(deriveReturnWake({ exitedAt: now - 200, wentHidden: true, machineState: 'sleeping', now }), 'wake', 'hidden then visible is a real return');
 +    assert.equal(deriveReturnWake({ exitedAt: now - RETURN_WAKE_MIN_AWAY_MS, wentHidden: false, machineState: 'sleeping', now }), 'wake');
++});
+-- 
+2.43.0
+
+
+From f978375b42aa02330eb79cc56e63fffee3eca118 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Tue, 10 Nov 2026 02:51:27 +0000
+Subject: [PATCH 2/2] Keep the screensaver down across a long-press exit and
+ page reloads
+
+Reopening the app after a long-press exit flashed the screensaver before
+the wake: the machine confirmed the sleep while the app was leaving, and
+that overlay was the first frame shown on return. The screensaver and
+panel dim are now suppressed from the exit until the return.
+
+The exit marker moves to localStorage. Decaid unloads the page after ten
+minutes in the background and reloads it on return, which lost the
+in-memory marker, so a long absence got the screensaver instead of a
+wake. A page loaded with the marker set is itself the return.
+
+If the app is still on screen when the check runs (iOS, or a failed
+exit), the suppression is undone and the overlay follows the machine.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01WabCzdX53ns7vgwepG6uCf
+---
+ src/modules/screensaver-policy.js |  16 +++++
+ src/modules/ui.js                 | 111 ++++++++++++++++++++++--------
+ test/screensaver-policy.test.mjs  |  12 ++++
+ 3 files changed, 111 insertions(+), 28 deletions(-)
+
+diff --git a/src/modules/screensaver-policy.js b/src/modules/screensaver-policy.js
+index 5b4fa39..3fed0d1 100644
+--- a/src/modules/screensaver-policy.js
++++ b/src/modules/screensaver-policy.js
+@@ -160,6 +160,22 @@ export function shouldExitAfterSleep(action, decentApp) {
+  */
+ export const RETURN_WAKE_MIN_AWAY_MS = 1500;
+ 
++/**
++ * How long after a long-press exit to check that the app really left. Decaid
++ * pauses the page's timers while it is in the background, so a check that runs
++ * on time means the app is still on screen (iOS, or the exit failed).
++ */
++export const EXIT_CHECK_MS = 3000;
++
++/**
++ * Did a long-press exit leave the app on screen? Then the screensaver
++ * suppression must be undone. A check that runs much later than scheduled was
++ * held up by paused timers, so the app did leave.
++ */
++export function exitDidNotLeave({ exitedAt, wentHidden, now = Date.now() } = {}) {
++    return !!exitedAt && !wentHidden && (now - exitedAt) < EXIT_CHECK_MS * 2;
++}
++
+ /**
+  * Should coming back to the app wake the machine?
+  *
+diff --git a/src/modules/ui.js b/src/modules/ui.js
+index d6befb2..a6eeeeb 100644
+--- a/src/modules/ui.js
++++ b/src/modules/ui.js
+@@ -4,7 +4,7 @@ import { getProfile, getWorkflow, updateWorkflow, setMachineState, setTargetHotW
+ import { resolveStatusStateKey, isActionTailSubstate } from './machine-status-policy.js';
+ import { openDB, getSetting } from './idb.js';
+ import { SCREENSAVER_CLOCK_FORMATS, SCREENSAVER_CLOCK_POSITIONS, SCREENSAVER_DATE_FORMATS, formatScreensaverClockDate, formatScreensaverClockTime, screensaverClockPositionStyle } from './screensaver-clock.js';
+-import { deriveSleepButtonAction, isWakePending, mayTapWakeMachine, shouldExitAfterSleep, deriveReturnWake, SLEEP_EXIT_HOLD_MS } from './screensaver-policy.js';
++import { deriveSleepButtonAction, isWakePending, mayTapWakeMachine, shouldExitAfterSleep, deriveReturnWake, exitDidNotLeave, setScreensaverSuppressed, EXIT_CHECK_MS, SLEEP_EXIT_HOLD_MS } from './screensaver-policy.js';
+ import { isBengleMachine, isBengleModel } from './machine.js';
+ import { STEAM_FLOW_PRESETS_BY_MODEL, MILK_STOP_PRESETS, resolveSteamFlowPresetsForModel, resolveSteamTileMode, steamSlotField as resolveSteamSlotField, milkTelemetryValue, steamFlowHighlightIndex, STEAM_SYNC_SYNCED, steamSyncField, foldSteamSyncState, shouldRetrySteamSync, steamSyncRetryDelay } from './steam-mode.js';
+ import { API_DEBOUNCE_MS } from './workflow-watch.js';
+@@ -2046,41 +2046,97 @@ export function wakeFromScreensaver() {
+ }
+ 
+ // Long-press Sleep left the app; the next return to it wakes the machine.
+-let exitedForSleepAt = 0;
+-let hiddenSinceExit = false;
++//
++// The marker lives in localStorage, not memory: after ten minutes in the
++// background Decaid unloads the page and reloads it on return, and Android may
++// close the app altogether. Either way the reloaded page still wakes the machine,
++// as reopening the de1app did.
++//
++// From the exit until the return, the screensaver and panel dim are suppressed:
++// the machine confirms the sleep while the app is leaving, and an overlay raised
++// then is the first thing shown on return, for a moment, before the wake.
++const SLEEP_EXIT_KEY = 'sleepExitPending';
+ let returnWakeInstalled = false;
+ 
++function readSleepExit() {
++    try {
++        const exit = JSON.parse(localStorage.getItem(SLEEP_EXIT_KEY) || 'null');
++        return exit && exit.at ? exit : null;
++    } catch {
++        return null;
++    }
++}
++
++function writeSleepExit(exit) {
++    try {
++        if (exit) localStorage.setItem(SLEEP_EXIT_KEY, JSON.stringify(exit));
++        else localStorage.removeItem(SLEEP_EXIT_KEY);
++    } catch {
++        // Storage unavailable: the in-page path below still covers a short absence.
++    }
++}
++
++// Suppress before the first machine snapshot can raise the overlay on a reload.
++if (readSleepExit()) setScreensaverSuppressed(true);
++
++function noteSleepExit() {
++    if (screensaverActive) hideScreensaver(); // PURE UI -- the sleep may already be confirmed
++    setScreensaverSuppressed(true);
++    writeSleepExit({ at: Date.now(), hidden: false });
++    setTimeout(() => {
++        const exit = readSleepExit();
++        if (!exitDidNotLeave({ exitedAt: exit?.at, wentHidden: !!exit?.hidden })) return;
++        // Still on screen: no return to wait for, so let the overlay follow the
++        // machine again.
++        writeSleepExit(null);
++        setScreensaverSuppressed(false);
++    }, EXIT_CHECK_MS);
++}
++
++function wakeOnReturn() {
++    const exit = readSleepExit();
++    if (!exit) return;
++    const decision = deriveReturnWake({
++        exitedAt: exit.at,
++        wentHidden: !!exit.hidden,
++        machineState: currentMachineState,
++    });
++    if (decision === 'wait') return;
++    writeSleepExit(null);
++    if (decision === 'wake') {
++        // The same wake as a tap on the screensaver: suppress the stale 'sleeping'
++        // frames still in flight, then send the one wake command.
++        if (screensaverActive) hideScreensaver();
++        noteWakeRequested();
++    }
++    setScreensaverSuppressed(false);
++    if (decision !== 'wake') return;
++    setMachineState('idle').catch((err) => {
++        logger.error('Return to app: failed to wake the machine:', err);
++        clearWakeRequest();
++    });
++}
++
+ function installReturnWake() {
+     if (returnWakeInstalled) return;
+     returnWakeInstalled = true;
+-    const onReturn = () => {
+-        const decision = deriveReturnWake({
+-            exitedAt: exitedForSleepAt,
+-            wentHidden: hiddenSinceExit,
+-            machineState: currentMachineState,
+-        });
+-        if (decision === 'wait') return;
+-        exitedForSleepAt = 0;
+-        hiddenSinceExit = false;
+-        if (decision === 'skip') return;
+-        // The same wake as a tap on the screensaver: hide it, suppress the stale
+-        // 'sleeping' frames still in flight, and send the one wake command.
+-        if (screensaverActive) hideScreensaver();
+-        noteWakeRequested();
+-        setMachineState('idle').catch((err) => {
+-            logger.error('Return to app: failed to wake the machine:', err);
+-            clearWakeRequest();
+-        });
+-    };
+     document.addEventListener('visibilitychange', () => {
+         if (document.visibilityState === 'hidden') {
+-            if (exitedForSleepAt) hiddenSinceExit = true;
++            const exit = readSleepExit();
++            if (exit && !exit.hidden) writeSleepExit({ ...exit, hidden: true });
+             return;
+         }
+-        onReturn();
++        wakeOnReturn();
+     });
+-    window.addEventListener('focus', onReturn);
+-    window.addEventListener('pageshow', onReturn);
++    window.addEventListener('focus', wakeOnReturn);
++    window.addEventListener('pageshow', wakeOnReturn);
++    // A page loaded with the marker set is itself the return (Decaid reloaded it,
++    // or the app was restarted).
++    const exit = readSleepExit();
++    if (exit) {
++        writeSleepExit({ ...exit, hidden: true });
++        wakeOnReturn();
++    }
+ }
+ 
+ /** We have asked the machine to wake and are waiting for it to confirm. */
+@@ -2626,8 +2682,7 @@ export function initUI(callbacks) {
+                 await setMachineState(action.command);
+                 logger.info(`Sleep button: machine reported "${currentMachineState}" -> requested "${action.command}".`);
+                 if (exitApp && shouldExitAfterSleep(action, window.decentApp)) {
+-                    exitedForSleepAt = Date.now();
+-                    hiddenSinceExit = false;
++                    noteSleepExit();
+                     window.decentApp.exitApp();
+                 }
+             } catch (err) {
+diff --git a/test/screensaver-policy.test.mjs b/test/screensaver-policy.test.mjs
+index fd77132..0e9f0b6 100644
+--- a/test/screensaver-policy.test.mjs
++++ b/test/screensaver-policy.test.mjs
+@@ -23,6 +23,8 @@ import {
+     shouldExitAfterSleep,
+     deriveReturnWake,
+     RETURN_WAKE_MIN_AWAY_MS,
++    exitDidNotLeave,
++    EXIT_CHECK_MS,
+     isWakePending,
+     WAKE_CONFIRM_GRACE_MS,
+ } from '../src/modules/screensaver-policy.js';
+@@ -314,3 +316,13 @@ test('focus churn right after the exit waits for the real return', () => {
+     assert.equal(deriveReturnWake({ exitedAt: now - 200, wentHidden: true, machineState: 'sleeping', now }), 'wake', 'hidden then visible is a real return');
+     assert.equal(deriveReturnWake({ exitedAt: now - RETURN_WAKE_MIN_AWAY_MS, wentHidden: false, machineState: 'sleeping', now }), 'wake');
+ });
++
++// --- exitDidNotLeave: a long-press exit that left the app on screen is undone
++
++test('an exit still on screen at the check undoes the screensaver suppression', () => {
++    const now = 100_000;
++    assert.equal(exitDidNotLeave({ exitedAt: now - EXIT_CHECK_MS, wentHidden: false, now }), true, 'iOS, or the exit failed');
++    assert.equal(exitDidNotLeave({ exitedAt: now - EXIT_CHECK_MS, wentHidden: true, now }), false, 'the page went hidden: it left');
++    assert.equal(exitDidNotLeave({ exitedAt: now - 60_000, wentHidden: false, now }), false, 'a late check means timers were paused in the background');
++    assert.equal(exitDidNotLeave({ exitedAt: 0, wentHidden: false, now }), false);
 +});
 -- 
 2.43.0

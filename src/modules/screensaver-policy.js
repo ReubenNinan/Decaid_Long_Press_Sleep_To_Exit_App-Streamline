@@ -161,6 +161,22 @@ export function shouldExitAfterSleep(action, decentApp) {
 export const RETURN_WAKE_MIN_AWAY_MS = 1500;
 
 /**
+ * How long after a long-press exit to check that the app really left. Decaid
+ * pauses the page's timers while it is in the background, so a check that runs
+ * on time means the app is still on screen (iOS, or the exit failed).
+ */
+export const EXIT_CHECK_MS = 3000;
+
+/**
+ * Did a long-press exit leave the app on screen? Then the screensaver
+ * suppression must be undone. A check that runs much later than scheduled was
+ * held up by paused timers, so the app did leave.
+ */
+export function exitDidNotLeave({ exitedAt, wentHidden, now = Date.now() } = {}) {
+    return !!exitedAt && !wentHidden && (now - exitedAt) < EXIT_CHECK_MS * 2;
+}
+
+/**
  * Should coming back to the app wake the machine?
  *
  * The de1app woke the machine when the app was reopened. Only after a long-press
