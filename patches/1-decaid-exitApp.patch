@@ -1,27 +1,6 @@
-From 9be076fee6574141eda98d1176849bd4f53c7f70 Mon Sep 17 00:00:00 2001
-From: Reuben Ninan <reubenninan@yahoo.com>
-Date: Sun, 25 Oct 2026 21:17:00 +0000
-Subject: [PATCH] Let skins exit the app with window.decentApp.exitApp()
-
-Adds exitApp() next to exitToDashboard() in the skin API script. The
-skin navigates to /__decent/exit-app, which the skin view accepts only
-from its own main frame. On Android this moves the task to the
-background, so machine connections and wake schedules keep running;
-desktop builds quit; iOS ignores it.
-
-This lets skins restore the de1app's long-press-sleep behaviour: put
-the machine to sleep and hand the tablet back to the user.
-
-Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
-Claude-Session: https://claude.ai/code/session_01WabCzdX53ns7vgwepG6uCf
----
- .../kotlin/net/tadel/reaprime/MainActivity.kt |  3 +
- doc/Skins.md                                  |  2 +-
- lib/src/skin_feature/skin_view.dart           | 75 +++++++++++++++++--
- lib/src/webui_support/webui_service.dart      |  8 ++
- .../skin_feature/skin_navigation_test.dart    | 73 ++++++++++++++++++
- .../webui_token_injection_test.dart           |  2 +
- 6 files changed, 157 insertions(+), 6 deletions(-)
+Decaid change for decentespresso/decaid#1035: window.decentApp.exitApp()
+As in the pull request from ReubenNinan:feat/skin-exit-app (c4edbf4), against decentespresso/decaid main (19a9030).
+Apply with: git apply 1-decaid-exitApp.patch
 
 diff --git a/android/app/src/main/kotlin/net/tadel/reaprime/MainActivity.kt b/android/app/src/main/kotlin/net/tadel/reaprime/MainActivity.kt
 index 4edf66a..26ec0d5 100644
@@ -37,91 +16,82 @@ index 4edf66a..26ec0d5 100644
                          else -> result.notImplemented()
                      }
                  }
+diff --git a/doc/AI_BUILD_NOTES.md b/doc/AI_BUILD_NOTES.md
+index aade271..bb13021 100644
+--- a/doc/AI_BUILD_NOTES.md
++++ b/doc/AI_BUILD_NOTES.md
+@@ -48,6 +48,7 @@ temporary real-hardware tuning builds where debug endpoints must be reachable.
+ - `flutter_with_commit.sh` injects the git commit hash as a compile-time constant via `--dart-define`.
+ - CI uses pinned Flutter version. Linux build smoke runs via Docker.
+ - Android uses `ForegroundTaskService` for background BLE. Auto-stops 5min after disconnect; auto-restarts on reconnect.
++- Skin `exitApp()` backgrounds Android with `moveTaskToBack(true)` on the `app/lifecycle` channel rather than finishing the activity, so the BLE connection and wake schedules keep running. Desktop quits through `exitApplication(AppExitType.cancelable)`; iOS cannot close itself, so the call does nothing there.
+ - `Makefile` targets: `build-arm`, `build-amd`, `dual-build` (Linux only, requires Docker/Colima).
+ 
+ ## Skin Camera Permissions on Apple Platforms
 diff --git a/doc/Skins.md b/doc/Skins.md
-index 25f265f..053f249 100644
+index 8a14457..27f1f28 100644
 --- a/doc/Skins.md
 +++ b/doc/Skins.md
-@@ -3511,7 +3511,7 @@ This shows "Back to MySkin" in the settings plugin's nav bar. When clicked, it n
+@@ -3610,7 +3610,7 @@ This shows "Back to MySkin" in the settings plugin's nav bar. When clicked, it n
  
  **External links:** When a skin runs inside the embedded webview (mobile/desktop app), navigations to the active skin origin, `localhost:3000`, and the settings plugin load in place; any other `http`/`https` link opens in the **system browser** while the skin stays loaded. A plain `<a href="https://…">` works, but the in-app webview blocks `target="_blank"` popups (`javaScriptCanOpenWindowsAutomatically: false`). For JS-driven links, use a delegated click handler with `window.open(url, '_blank')` and a `location.href` fallback so the navigation reaches `shouldOverrideUrlLoading` and is handed off to the OS.
  
--**Return to the dashboard:** Port 3000 is a stable no-store entry point that redirects to the selected skin's origin, normally retained across restarts as described in [Skin Origins and Browser Storage](#skin-origins-and-browser-storage). The active origin loads the tokenless `/__decent/skin-api.js` from an absolute same-origin URL, which exposes `window.decentApp.exitToDashboard()`. ReaPrime stores a newly rotated, skin-bound account-proxy token in escaped page metadata that only the same-origin script reads; switching or stopping the server revokes it. Separate skin origins prevent a stale tab from reading another skin's token. Token injection accepts loopback and IP addresses currently assigned to the device, including Ethernet and secondary adapters; arbitrary hostnames and stale addresses are rejected. If local interface enumeration is unavailable, the WiFi address cached for the server link is used as a fallback. A hostname that resolves to one of those addresses — a router DNS record, an mDNS name, a hosts file entry — reaches the entry redirect and receives the script tag, but never the token, which stays restricted to loopback and literal device addresses so the DNS-rebinding boundary holds. A skin that needs the account-proxy token must therefore be opened by loopback or device IP; a skin that only needs `window.decentApp` also works when opened by name. The script response also uses `Cross-Origin-Resource-Policy: same-origin`. In the embedded webview the callback closes the skin and reveals the Decent dashboard. In an external browser it is a no-op. The script works with `script-src 'self'`; policies that reject all same-origin scripts, such as `script-src 'none'` or nonce-only policies without `'self'`, also reject this API.
-+**Return to the dashboard:** Port 3000 is a stable no-store entry point that redirects to the selected skin's origin, normally retained across restarts as described in [Skin Origins and Browser Storage](#skin-origins-and-browser-storage). The active origin loads the tokenless `/__decent/skin-api.js` from an absolute same-origin URL, which exposes `window.decentApp.exitToDashboard()`. ReaPrime stores a newly rotated, skin-bound account-proxy token in escaped page metadata that only the same-origin script reads; switching or stopping the server revokes it. Separate skin origins prevent a stale tab from reading another skin's token. Token injection accepts loopback and IP addresses currently assigned to the device, including Ethernet and secondary adapters; arbitrary hostnames and stale addresses are rejected. If local interface enumeration is unavailable, the WiFi address cached for the server link is used as a fallback. A hostname that resolves to one of those addresses — a router DNS record, an mDNS name, a hosts file entry — reaches the entry redirect and receives the script tag, but never the token, which stays restricted to loopback and literal device addresses so the DNS-rebinding boundary holds. A skin that needs the account-proxy token must therefore be opened by loopback or device IP; a skin that only needs `window.decentApp` also works when opened by name. The script response also uses `Cross-Origin-Resource-Policy: same-origin`. In the embedded webview the callback closes the skin and reveals the Decent dashboard. In an external browser it is a no-op. The same script exposes `window.decentApp.exitApp()`, for example after asking the machine to sleep. On Android it moves Decaid to the background like the Home button, so machine connections and wake schedules keep running and reopening Decaid returns to the skin. Desktop builds quit. iOS does not let apps close themselves, so the call does nothing there, and it is a no-op in an external browser. The script works with `script-src 'self'`; policies that reject all same-origin scripts, such as `script-src 'none'` or nonce-only policies without `'self'`, also reject this API.
+-**Return to the dashboard:** Port 3000 is a stable no-store entry point that redirects to the selected skin's origin, normally retained across restarts as described in [Skin Origins and Browser Storage](#skin-origins-and-browser-storage). The active origin loads the tokenless `/__decent/skin-api.js` from an absolute same-origin URL, which exposes `window.decentApp.exitToDashboard()` and `window.decentApp.switchSkin(skinId)`, described in [Switching Skins from an Embedded Skin](#switching-skins-from-an-embedded-skin). ReaPrime stores a newly rotated, skin-bound account-proxy token in escaped page metadata that only the same-origin script reads; switching or stopping the server revokes it. Separate skin origins prevent a stale tab from reading another skin's token. Token injection accepts loopback and IP addresses currently assigned to the device, including Ethernet and secondary adapters; arbitrary hostnames and stale addresses are rejected. If local interface enumeration is unavailable, the WiFi address cached for the server link is used as a fallback. A hostname that resolves to one of those addresses — a router DNS record, an mDNS name, a hosts file entry — reaches the entry redirect and receives the script tag, but never the token, which stays restricted to loopback and literal device addresses so the DNS-rebinding boundary holds. A skin that needs the account-proxy token must therefore be opened by loopback or device IP; a skin that only needs `window.decentApp` also works when opened by name. The script response also uses `Cross-Origin-Resource-Policy: same-origin`. In the embedded webview the callback closes the skin and reveals the Decent dashboard. In an external browser it is a no-op. The script works with `script-src 'self'`; policies that reject all same-origin scripts, such as `script-src 'none'` or nonce-only policies without `'self'`, also reject this API.
++**Return to the dashboard:** Port 3000 is a stable no-store entry point that redirects to the selected skin's origin, normally retained across restarts as described in [Skin Origins and Browser Storage](#skin-origins-and-browser-storage). The active origin loads the tokenless `/__decent/skin-api.js` from an absolute same-origin URL, which exposes `window.decentApp.exitToDashboard()` and `window.decentApp.switchSkin(skinId)`, described in [Switching Skins from an Embedded Skin](#switching-skins-from-an-embedded-skin). ReaPrime stores a newly rotated, skin-bound account-proxy token in escaped page metadata that only the same-origin script reads; switching or stopping the server revokes it. Separate skin origins prevent a stale tab from reading another skin's token. Token injection accepts loopback and IP addresses currently assigned to the device, including Ethernet and secondary adapters; arbitrary hostnames and stale addresses are rejected. If local interface enumeration is unavailable, the WiFi address cached for the server link is used as a fallback. A hostname that resolves to one of those addresses — a router DNS record, an mDNS name, a hosts file entry — reaches the entry redirect and receives the script tag, but never the token, which stays restricted to loopback and literal device addresses so the DNS-rebinding boundary holds. A skin that needs the account-proxy token must therefore be opened by loopback or device IP; a skin that only needs `window.decentApp` also works when opened by name. The script response also uses `Cross-Origin-Resource-Policy: same-origin`. In the embedded webview the callback closes the skin and reveals the Decent dashboard. In an external browser it is a no-op. The same script exposes `window.decentApp.exitApp()`, for example after asking the machine to sleep. It returns `false` and does nothing outside the embedded WebView. Like `switchSkin`, it navigates the top frame to `/__decent/exit-app?nonce=<nonce>` on its own origin, and Decaid accepts the request only with the active `SkinView`'s main-frame nonce, so a cross-origin subframe cannot trigger it. On Android it moves Decaid to the background like the Home button, so machine connections and wake schedules keep running and reopening Decaid returns to the skin. Desktop builds quit. iOS does not let apps close themselves, so the call does nothing there. The script works with `script-src 'self'`; policies that reject all same-origin scripts, such as `script-src 'none'` or nonce-only policies without `'self'`, also reject this API.
  
  The embedded webview also shows a platform-specific navigation guide when a skin opens. On Windows, choose **Back to Dashboard** from the system menu, available from the window icon or by right-clicking the title bar. Disable or restore the guide in **Settings** under **General** with **Skin navigation guide**.
  
 diff --git a/lib/src/skin_feature/skin_view.dart b/lib/src/skin_feature/skin_view.dart
-index feba117..07f9bc7 100644
+index d1bd298..87b669d 100644
 --- a/lib/src/skin_feature/skin_view.dart
 +++ b/lib/src/skin_feature/skin_view.dart
-@@ -1,6 +1,7 @@
- import 'dart:async';
+@@ -2,6 +2,7 @@ import 'dart:async';
  import 'dart:convert';
  import 'dart:io';
+ import 'dart:math';
 +import 'dart:ui' show AppExitResponse, AppExitType;
  
  import 'package:device_info_plus/device_info_plus.dart';
  import 'package:flutter/foundation.dart';
-@@ -29,14 +30,19 @@ import 'package:url_launcher/url_launcher.dart';
+@@ -34,7 +35,14 @@ import 'package:url_launcher/url_launcher.dart';
  
  export 'package:reaprime/src/skin_feature/skin_exit_instructions.dart';
  
--enum SkinNavDecision { exitDashboard, allow, openExternal, block }
-+enum SkinNavDecision { exitDashboard, exitApp, allow, openExternal, block }
+-enum SkinNavDecision { exitDashboard, switchSkin, allow, openExternal, block }
++enum SkinNavDecision {
++  exitDashboard,
++  exitApp,
++  switchSkin,
++  allow,
++  openExternal,
++  block,
++}
  
  SkinNavDecision classifySkinNavigation(Uri? url, {int skinPort = 3000}) {
    if (url == null) return SkinNavDecision.block;
-   if (url.host == 'localhost' && url.path.startsWith('/__decent/')) {
--    return url.toString() == skinExitDashboardUrlForPort(skinPort)
--        ? SkinNavDecision.exitDashboard
--        : SkinNavDecision.block;
-+    final target = url.toString();
-+    if (target == skinExitDashboardUrlForPort(skinPort)) {
-+      return SkinNavDecision.exitDashboard;
-+    }
-+    if (target == skinExitAppUrlForPort(skinPort)) {
+@@ -47,6 +55,16 @@ SkinNavDecision classifySkinNavigation(Uri? url, {int skinPort = 3000}) {
+         (url.queryParameters['id'] ?? '').isNotEmpty) {
+       return SkinNavDecision.switchSkin;
+     }
++    if (url.path == skinExitAppPath &&
++        url.scheme == 'http' &&
++        url.port == skinPort &&
++        url.userInfo.isEmpty &&
++        !url.hasFragment &&
++        url.queryParametersAll.length == 1 &&
++        url.queryParametersAll['nonce']?.length == 1 &&
++        url.queryParameters['nonce']!.isNotEmpty) {
 +      return SkinNavDecision.exitApp;
 +    }
-+    return SkinNavDecision.block;
+     return url.toString() == skinExitDashboardUrlForPort(skinPort)
+         ? SkinNavDecision.exitDashboard
+         : SkinNavDecision.block;
+@@ -184,6 +202,22 @@ class SkinExitCoordinator {
    }
-   if (url.scheme == 'http' &&
-       url.host == 'localhost' &&
-@@ -54,6 +60,10 @@ SkinNavDecision classifySkinNavigation(Uri? url, {int skinPort = 3000}) {
- bool shouldShowSkinLoadError(bool? isForMainFrame) => isForMainFrame != false;
+ }
  
- class SkinExitCoordinator {
-+  SkinExitCoordinator({this.exitUrlForPort = skinExitDashboardUrlForPort});
-+
-+  final String Function(int port) exitUrlForPort;
-+
-   bool _inProgress = false;
- 
-   bool get inProgress => _inProgress;
-@@ -66,7 +76,7 @@ class SkinExitCoordinator {
-   }) {
-     if (_inProgress ||
-         !isForMainFrame ||
--        target?.toString() != skinExitDashboardUrlForPort(skinPort) ||
-+        target?.toString() != exitUrlForPort(skinPort) ||
-         topLevelUri == null ||
-         topLevelUri.scheme != 'http' ||
-         topLevelUri.host != 'localhost' ||
-@@ -77,6 +87,30 @@ class SkinExitCoordinator {
-     _inProgress = true;
-     return true;
-   }
-+
-+  /// Allows another request after an exit that leaves the skin mounted, such
-+  /// as sending the app to the background.
-+  void finish() => _inProgress = false;
-+}
-+
 +const _appLifecycleChannel = MethodChannel('app/lifecycle');
 +
-+/// Leaves the app without stopping it where the platform allows: Android
-+/// moves the task to the background, so machine connections and wake
-+/// schedules keep running. Desktop platforms quit. iOS does not permit apps
-+/// to close themselves, so it returns false.
 +Future<bool> exitAppFromSkin() async {
 +  if (Platform.isAndroid) {
 +    return await _appLifecycleChannel.invokeMethod<bool>('moveTaskToBack') ??
@@ -134,24 +104,25 @@ index feba117..07f9bc7 100644
 +    return response == AppExitResponse.exit;
 +  }
 +  return false;
- }
- 
- class SkinView extends StatefulWidget {
-@@ -133,6 +167,9 @@ class _SkinViewState extends State<SkinView> with WidgetsBindingObserver {
-   InAppWebViewController? _webViewController;
++}
++
+ String _generateSwitchNonce() {
+   final random = Random.secure();
+   return base64Url.encode(List<int>.generate(24, (_) => random.nextInt(256)));
+@@ -254,6 +288,7 @@ class _SkinViewState extends State<SkinView> with WidgetsBindingObserver {
    Object _webViewAttempt = Object();
+   final String _switchNonce = _generateSwitchNonce();
    final _skinExitCoordinator = SkinExitCoordinator();
-+  final _skinAppExitCoordinator = SkinExitCoordinator(
-+    exitUrlForPort: skinExitAppUrlForPort,
-+  );
++  bool _appExitInProgress = false;
    Uri? _mainFrameUri;
    late final _camera = SkinCameraWebViewAccess(
      context: () => mounted ? context : null,
-@@ -269,6 +306,18 @@ class _SkinViewState extends State<SkinView> with WidgetsBindingObserver {
-     );
+@@ -406,6 +441,19 @@ class _SkinViewState extends State<SkinView> with WidgetsBindingObserver {
+     _log.info('Skin switch to $skinId: ${outcome.name}');
    }
  
 +  Future<void> _exitApp() async {
++    _appExitInProgress = true;
 +    try {
 +      if (!await exitAppFromSkin()) {
 +        _log.info('Platform did not leave the app for skin exit request');
@@ -159,58 +130,62 @@ index feba117..07f9bc7 100644
 +    } catch (e, st) {
 +      _log.warning('Skin app exit failed', e, st);
 +    } finally {
-+      _skinAppExitCoordinator.finish();
++      _appExitInProgress = false;
 +    }
 +  }
 +
    void _exitToDashboard() {
      Navigator.of(
        context,
-@@ -632,6 +681,9 @@ class _SkinViewState extends State<SkinView> with WidgetsBindingObserver {
+@@ -791,6 +839,11 @@ class _SkinViewState extends State<SkinView> with WidgetsBindingObserver {
          }
        },
        onReceivedError: (controller, request, error) {
-+        if (request.url.toString() == skinExitAppUrlForPort(widget.port)) {
++        if (request.url.host == 'localhost' &&
++            request.url.port == widget.port &&
++            request.url.path == skinExitAppPath) {
 +          return;
 +        }
          if (_skinExitCoordinator.inProgress &&
              request.url.toString() ==
                  skinExitDashboardUrlForPort(widget.port)) {
-@@ -666,6 +718,19 @@ class _SkinViewState extends State<SkinView> with WidgetsBindingObserver {
+@@ -826,6 +879,21 @@ class _SkinViewState extends State<SkinView> with WidgetsBindingObserver {
                _log.warning('Rejected skin dashboard request');
              }
              return NavigationActionPolicy.CANCEL;
 +          case SkinNavDecision.exitApp:
-+            if (_skinAppExitCoordinator.tryStart(
-+              target: uri,
-+              isForMainFrame: navigationAction.isForMainFrame,
-+              topLevelUri: _mainFrameUri,
-+              skinPort: widget.port,
-+            )) {
++            if (!_appExitInProgress &&
++                isTrustedSkinSwitchRequest(
++                  target: uri,
++                  isForMainFrame: navigationAction.isForMainFrame,
++                  topLevelUri: _mainFrameUri,
++                  skinPort: widget.port,
++                  expectedNonce: _switchNonce,
++                )) {
 +              _log.info('Skin requested app exit');
 +              unawaited(_exitApp());
 +            } else {
 +              _log.warning('Rejected skin app exit request');
 +            }
 +            return NavigationActionPolicy.CANCEL;
-           case SkinNavDecision.allow:
-             _log.fine('Allowing navigation to: $uri');
-             return NavigationActionPolicy.ALLOW;
+           case SkinNavDecision.switchSkin:
+             if (isTrustedSkinSwitchRequest(
+               target: uri,
 diff --git a/lib/src/webui_support/webui_service.dart b/lib/src/webui_support/webui_service.dart
-index e2ece6f..14b03c0 100644
+index 337d747..ca43ad9 100644
 --- a/lib/src/webui_support/webui_service.dart
 +++ b/lib/src/webui_support/webui_service.dart
 @@ -37,6 +37,7 @@ class _ResolvedHost {
  const skinApiScriptPath = '/__decent/skin-api.js';
  const skinExitDashboardPath = '/__decent/exit-dashboard';
- const skinExitDashboardUrl = 'http://localhost:3000$skinExitDashboardPath';
+ const skinSwitchPath = '/__decent/switch-skin';
 +const skinExitAppPath = '/__decent/exit-app';
+ const skinSwitchNonceGlobal = '__DECENT_SWITCH_NONCE__';
+ const skinExitDashboardUrl = 'http://localhost:3000$skinExitDashboardPath';
  const _skinProxyTokenMetaName = 'reaprime-proxy-token';
- const _htmlAttributeEscape = HtmlEscape(HtmlEscapeMode.attribute);
- 
-@@ -93,6 +94,9 @@ List<int> injectSkinApiScriptTagBytes(
- String skinExitDashboardUrlForPort(int port) =>
-     'http://localhost:$port$skinExitDashboardPath';
+@@ -98,6 +99,9 @@ String skinExitDashboardUrlForPort(int port) =>
+ String skinSwitchUrlForPort(int port) =>
+     'http://localhost:$port$skinSwitchPath';
  
 +String skinExitAppUrlForPort(int port) =>
 +    'http://localhost:$port$skinExitAppPath';
@@ -218,120 +193,166 @@ index e2ece6f..14b03c0 100644
  String buildSkinApiJavaScript({int port = 3000}) {
    return 'var tokenMeta=document.querySelector('
        '${jsonEncode('meta[name="$_skinProxyTokenMetaName"]')});'
-@@ -101,6 +105,10 @@ String buildSkinApiJavaScript({int port = 3000}) {
-       'window.decentApp.exitToDashboard=function(){'
-       'if(window.__DECENT_HOST__)window.location.assign('
-       '${jsonEncode(skinExitDashboardUrlForPort(port))});'
+@@ -116,6 +120,14 @@ String buildSkinApiJavaScript({int port = 3000}) {
+       '+"?id="+encodeURIComponent(skinId)'
+       '+"&nonce="+encodeURIComponent(nonce));'
+       'return true;'
 +      '};'
 +      'window.decentApp.exitApp=function(){'
-+      'if(window.__DECENT_HOST__)window.location.assign('
-+      '${jsonEncode(skinExitAppUrlForPort(port))});'
++      'if(!window.__DECENT_HOST__)return false;'
++      'var nonce=window.$skinSwitchNonceGlobal;'
++      'if(typeof nonce!=="string"||nonce.length===0)return false;'
++      'window.location.assign(${jsonEncode(skinExitAppUrlForPort(port))}'
++      '+"?nonce="+encodeURIComponent(nonce));'
++      'return true;'
        '};';
  }
  
-diff --git a/test/unit/skin_feature/skin_navigation_test.dart b/test/unit/skin_feature/skin_navigation_test.dart
-index f607318..ebc0e85 100644
---- a/test/unit/skin_feature/skin_navigation_test.dart
-+++ b/test/unit/skin_feature/skin_navigation_test.dart
-@@ -217,6 +217,34 @@ void main() {
-       }
-     });
- 
-+    test('exits the app for the exact skin app exit URL', () {
-+      final url = skinExitAppUrlForPort(43210);
+diff --git a/test/unit/skin_feature/skin_exit_app_navigation_test.dart b/test/unit/skin_feature/skin_exit_app_navigation_test.dart
+new file mode 100644
+index 0000000..7c0a45b
+--- /dev/null
++++ b/test/unit/skin_feature/skin_exit_app_navigation_test.dart
+@@ -0,0 +1,142 @@
++import 'package:flutter_test/flutter_test.dart';
++import 'package:reaprime/src/skin_feature/skin_view.dart';
++import 'package:reaprime/src/webui_support/webui_service.dart';
++
++void main() {
++  const skinPort = 24801;
++  const nonce = 'cafebabe-main-frame-nonce';
++  String exitUrl({int port = skinPort, String query = 'nonce=$nonce'}) =>
++      'http://localhost:$port$skinExitAppPath${query.isEmpty ? '' : '?$query'}';
++  final trustedPage = Uri.parse('http://localhost:$skinPort/');
++
++  group('classifySkinNavigation', () {
++    test('accepts an exit request carrying a nonce on the skin port', () {
 +      expect(
-+        classifySkinNavigation(Uri.parse(url), skinPort: 43210),
++        classifySkinNavigation(Uri.parse(exitUrl()), skinPort: skinPort),
 +        SkinNavDecision.exitApp,
 +      );
 +    });
 +
-+    test('blocks extended and malformed skin app exit URLs', () {
-+      final url = skinExitAppUrlForPort(43210);
++    test('blocks an exit request without a nonce', () {
++      for (final url in [exitUrl(query: ''), exitUrl(query: 'nonce=')]) {
++        expect(
++          classifySkinNavigation(Uri.parse(url), skinPort: skinPort),
++          SkinNavDecision.block,
++          reason: url,
++        );
++      }
++    });
++
++    test('blocks extended and malformed exit requests', () {
 +      for (final url in [
-+        '$url/path',
-+        '$url?unexpected=true',
-+        '$url#fragment',
-+        'http://user@localhost:43210$skinExitAppPath',
-+        'http://localhost:43211$skinExitAppPath',
-+        'http://localhost$skinExitAppPath',
-+        'https://localhost:43210$skinExitAppPath',
-+        'http://example.com:43210$skinExitAppPath',
++        exitUrl(query: 'nonce=$nonce&nonce=$nonce'),
++        exitUrl(query: 'nonce=$nonce&id=streamline.js'),
++        '${exitUrl()}#fragment',
++        'http://localhost:$skinPort$skinExitAppPath/extra?nonce=$nonce',
++        'http://user@localhost:$skinPort$skinExitAppPath?nonce=$nonce',
++        exitUrl(port: 24802),
++        'http://localhost$skinExitAppPath?nonce=$nonce',
 +      ]) {
 +        expect(
-+          classifySkinNavigation(Uri.parse(url), skinPort: 43210),
++          classifySkinNavigation(Uri.parse(url), skinPort: skinPort),
++          SkinNavDecision.block,
++          reason: url,
++        );
++      }
++    });
++
++    test('never accepts a remote exit request', () {
++      for (final url in [
++        'https://localhost:$skinPort$skinExitAppPath?nonce=$nonce',
++        'http://example.com:$skinPort$skinExitAppPath?nonce=$nonce',
++      ]) {
++        expect(
++          classifySkinNavigation(Uri.parse(url), skinPort: skinPort),
 +          isNot(SkinNavDecision.exitApp),
 +          reason: url,
 +        );
 +      }
 +    });
 +
-     test('opens external https links in the browser', () {
-       expect(
-         classifySkinNavigation(
-@@ -303,5 +331,50 @@ void main() {
-         isFalse,
-       );
-     });
-+
-+    test('app exit coordinator only accepts its own URL', () {
-+      final appTarget = Uri.parse(skinExitAppUrlForPort(43210));
-+      final coordinator = SkinExitCoordinator(
-+        exitUrlForPort: skinExitAppUrlForPort,
-+      );
-+
++    test('still routes the dashboard exit and skin switch hooks', () {
 +      expect(
-+        coordinator.tryStart(
-+          target: target,
-+          isForMainFrame: true,
-+          topLevelUri: trustedPage,
-+          skinPort: 43210,
++        classifySkinNavigation(
++          Uri.parse(skinExitDashboardUrlForPort(skinPort)),
++          skinPort: skinPort,
 +        ),
++        SkinNavDecision.exitDashboard,
++      );
++      expect(
++        classifySkinNavigation(
++          Uri.parse(
++            'http://localhost:$skinPort$skinSwitchPath?id=a&nonce=$nonce',
++          ),
++          skinPort: skinPort,
++        ),
++        SkinNavDecision.switchSkin,
++      );
++    });
++  });
++
++  group('exit request trust', () {
++    bool trusted({
++      String query = 'nonce=$nonce',
++      bool isForMainFrame = true,
++      Uri? topLevelUri,
++      String expectedNonce = nonce,
++    }) => isTrustedSkinSwitchRequest(
++      target: Uri.parse(exitUrl(query: query)),
++      isForMainFrame: isForMainFrame,
++      topLevelUri: topLevelUri ?? trustedPage,
++      skinPort: skinPort,
++      expectedNonce: expectedNonce,
++    );
++
++    test('accepts the main-frame nonce from the trusted skin page', () {
++      expect(trusted(), isTrue);
++    });
++
++    test('rejects a missing nonce', () {
++      expect(trusted(query: ''), isFalse);
++      expect(trusted(query: 'nonce='), isFalse);
++    });
++
++    test('rejects a wrong nonce', () {
++      expect(trusted(query: 'nonce=guessed'), isFalse);
++    });
++
++    test('rejects a stale nonce from a retired view', () {
++      expect(trusted(expectedNonce: 'a-newer-view-nonce'), isFalse);
++    });
++
++    test('never accepts an empty expected nonce', () {
++      expect(trusted(query: 'nonce=', expectedNonce: ''), isFalse);
++    });
++
++    test(
++      'rejects a top-level navigation started by a cross-origin subframe',
++      () {
++        expect(trusted(query: '', isForMainFrame: true), isFalse);
++        expect(trusted(query: 'nonce=guessed', isForMainFrame: true), isFalse);
++      },
++    );
++
++    test('rejects subframe navigations and untrusted top-level pages', () {
++      expect(trusted(isForMainFrame: false), isFalse);
++      expect(
++        trusted(topLevelUri: Uri.parse('http://localhost:24802/')),
 +        isFalse,
 +      );
-+      expect(
-+        coordinator.tryStart(
-+          target: appTarget,
-+          isForMainFrame: true,
-+          topLevelUri: trustedPage,
-+          skinPort: 43210,
-+        ),
-+        isTrue,
-+      );
++      expect(trusted(topLevelUri: Uri.parse('http://example.com/')), isFalse);
 +    });
++  });
 +
-+    test('finish allows a later request', () {
-+      final appTarget = Uri.parse(skinExitAppUrlForPort(43210));
-+      final coordinator = SkinExitCoordinator(
-+        exitUrlForPort: skinExitAppUrlForPort,
-+      );
-+      bool start() => coordinator.tryStart(
-+        target: appTarget,
-+        isForMainFrame: true,
-+        topLevelUri: trustedPage,
-+        skinPort: 43210,
-+      );
++  test('skin API reads the main-frame nonce for exitApp', () {
++    final script = buildSkinApiJavaScript(port: skinPort);
 +
-+      expect(start(), isTrue);
-+      expect(start(), isFalse);
-+      coordinator.finish();
-+      expect(coordinator.inProgress, isFalse);
-+      expect(start(), isTrue);
-+    });
-   });
- }
-diff --git a/test/webui_support/webui_token_injection_test.dart b/test/webui_support/webui_token_injection_test.dart
-index 8c1566c..1b55b50 100644
---- a/test/webui_support/webui_token_injection_test.dart
-+++ b/test/webui_support/webui_token_injection_test.dart
-@@ -87,6 +87,8 @@ const bodyExample = "</body>";
-     expect(script, contains('tokenMeta.content'));
-     expect(script, isNot(contains(token)));
-     expect(script, contains(skinExitDashboardUrl));
 +    expect(script, contains('window.decentApp.exitApp'));
-+    expect(script, contains(skinExitAppUrlForPort(3000)));
-   });
- 
-   test('injects the token as escaped non-executable metadata', () {
--- 
-2.43.0
-
++    expect(script, contains('http://localhost:$skinPort$skinExitAppPath'));
++    expect(script, contains('window.$skinSwitchNonceGlobal'));
++    expect(script, contains('"?nonce="'));
++  });
++}

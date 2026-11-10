@@ -4,10 +4,10 @@ A proposed change for **Decaid** and the **Streamline.js** skin that brings back
 a de1app feature: hold **Sleep** to put the machine to sleep and leave the app,
 so the tablet can be used normally while the machine stays asleep.
 
-> **Status: proposal, not yet working in Decaid.** Current Decaid releases don't
-> let a skin leave the app, so on today's Decaid, holding Sleep just puts the
-> machine to sleep and shows the screensaver. The changes below are written,
-> tested, and ready for the Decent team to review.
+> **Status: in review.** The Decaid change was accepted in
+> [decentespresso/decaid#1035](https://github.com/decentespresso/decaid/issues/1035)
+> and is in review as a pull request. Until a Decaid release includes it,
+> holding Sleep just puts the machine to sleep and shows the screensaver.
 
 ## The problem
 
@@ -34,9 +34,10 @@ Two small changes: one in Decaid, one in the skin.
 A new function in the skin API, next to the existing `exitToDashboard()`. It
 uses the same safety design:
 
-- The skin navigates to `/__decent/exit-app`. Decaid cancels that navigation and
-  acts on it only if it comes from the skin's own top-level page. Subframes,
-  other origins and modified URLs are rejected, just as for `exit-dashboard`.
+- The skin navigates to `/__decent/exit-app?nonce=<nonce>`. Decaid cancels that
+  navigation and acts on it only with the per-view nonce it injects into the
+  skin's main frame, the same protection as `switchSkin()`. Embedded pages from
+  other sites, subframes, other origins and modified URLs are rejected.
 - **Android:** `moveTaskToBack(true)`, the same as pressing Home. Decaid keeps
   running in the background, so the machine connection and scheduled wake times
   keep working, and reopening Decaid returns straight to the skin. The screen
@@ -49,16 +50,16 @@ uses the same safety design:
 Skins that don't call it are unaffected.
 
 **Patch:** [`patches/1-decaid-exitApp.patch`](patches/1-decaid-exitApp.patch),
-about 155 lines including tests and docs, against
+about 230 lines including tests and docs, against
 [decentespresso/decaid](https://github.com/decentespresso/decaid).
 
 | File | Change |
 |---|---|
 | `lib/src/webui_support/webui_service.dart` | Adds `exitApp()` to the skin API script and the exit-app URL |
-| `lib/src/skin_feature/skin_view.dart` | Routes the exit-app URL, reuses the exit guard, and backgrounds or quits by platform |
+| `lib/src/skin_feature/skin_view.dart` | Routes the exit-app URL, checks its nonce, and backgrounds or quits by platform |
 | `android/.../MainActivity.kt` | Adds `moveTaskToBack` to the existing `app/lifecycle` channel |
-| `doc/Skins.md` | Documents `exitApp()` |
-| `test/...` | Tests the URL rules, the guard, and the API script |
+| `doc/Skins.md`, `doc/AI_BUILD_NOTES.md` | Documents `exitApp()` and the platform behaviour |
+| `test/unit/skin_feature/skin_exit_app_navigation_test.dart` | Tests the URL rules, missing, wrong and stale nonces, and subframe-started navigations |
 
 ### 2. Streamline.js: long-press Sleep
 
@@ -105,12 +106,12 @@ tested along the way.
 
 ## Next steps
 
-1. Open an issue on [decentespresso/decaid](https://github.com/decentespresso/decaid/issues)
-   proposing `exitApp()`, following Decaid's issue-first contribution process.
-2. If the maintainers accept it, submit the Decaid patch as a pull request,
-   adjusting it to their feedback (for example a REST endpoint or a setting
-   instead).
-3. Offer the Streamline.js change to its maintainers.
+1. ~~Open an issue proposing `exitApp()`~~: accepted in decentespresso/decaid#1035.
+2. Decaid pull request: in review, with the maintainer's requested nonce
+   protection added.
+3. Streamline.js: the long-press change is proposed in an issue on
+   [decentespresso/streamline-js](https://github.com/decentespresso/streamline-js/issues),
+   following its issue-first process.
 
 ## Trying the skin (preview)
 
