@@ -4,7 +4,7 @@ import { getProfile, getWorkflow, updateWorkflow, setMachineState, setTargetHotW
 import { resolveStatusStateKey, isActionTailSubstate } from './machine-status-policy.js';
 import { openDB, getSetting } from './idb.js';
 import { SCREENSAVER_CLOCK_FORMATS, SCREENSAVER_CLOCK_POSITIONS, SCREENSAVER_DATE_FORMATS, formatScreensaverClockDate, formatScreensaverClockTime, screensaverClockPositionStyle } from './screensaver-clock.js';
-import { deriveSleepButtonAction, isWakePending, mayTapWakeMachine, shouldExitAfterSleep, SLEEP_EXIT_HOLD_MS } from './screensaver-policy.js';
+import { deriveSleepButtonAction, isWakePending, mayTapWakeMachine, shouldExitAfterSleep, deriveReturnWake, SLEEP_EXIT_HOLD_MS } from './screensaver-policy.js';
 import { isBengleMachine, isBengleModel } from './machine.js';
 import { STEAM_FLOW_PRESETS_BY_MODEL, MILK_STOP_PRESETS, resolveSteamFlowPresetsForModel, resolveSteamTileMode, steamSlotField as resolveSteamSlotField, milkTelemetryValue, steamFlowHighlightIndex, STEAM_SYNC_SYNCED, steamSyncField, foldSteamSyncState, shouldRetrySteamSync, steamSyncRetryDelay } from './steam-mode.js';
 import { API_DEBOUNCE_MS } from './workflow-watch.js';
@@ -2045,6 +2045,45 @@ export function wakeFromScreensaver() {
     });
 }
 
+// Long-press Sleep left the app; the next return to it wakes the machine.
+let exitedForSleepAt = 0;
+let hiddenSinceExit = false;
+let returnWakeInstalled = false;
+
+function installReturnWake() {
+    if (returnWakeInstalled) return;
+    returnWakeInstalled = true;
+    const onReturn = () => {
+        const decision = deriveReturnWake({
+            exitedAt: exitedForSleepAt,
+            wentHidden: hiddenSinceExit,
+            machineState: currentMachineState,
+        });
+        if (decision === 'wait') return;
+        exitedForSleepAt = 0;
+        hiddenSinceExit = false;
+        if (decision === 'skip') return;
+        logger.warn(`[exit-test] returned to the app; waking (state=${currentMachineState})`);
+        // The same wake as a tap on the screensaver: hide it, suppress the stale
+        // 'sleeping' frames still in flight, and send the one wake command.
+        if (screensaverActive) hideScreensaver();
+        noteWakeRequested();
+        setMachineState('idle').catch((err) => {
+            logger.error('Return to app: failed to wake the machine:', err);
+            clearWakeRequest();
+        });
+    };
+    document.addEventListener('visibilitychange', () => {
+        if (document.visibilityState === 'hidden') {
+            if (exitedForSleepAt) hiddenSinceExit = true;
+            return;
+        }
+        onReturn();
+    });
+    window.addEventListener('focus', onReturn);
+    window.addEventListener('pageshow', onReturn);
+}
+
 /** We have asked the machine to wake and are waiting for it to confirm. */
 export function noteWakeRequested() {
     wakeRequestedAt = Date.now();
@@ -2592,6 +2631,8 @@ export function initUI(callbacks) {
                 if (exitApp) logger.warn(`[exit-test] sleep accepted; command=${action.command} host=${!!window.__DECENT_HOST__} decentApp=${window.decentApp ? Object.keys(window.decentApp).join(',') : 'none'} page=${location.href}`);
                 if (exitApp && shouldExitAfterSleep(action, window.decentApp)) {
                     logger.warn('[exit-test] calling decentApp.exitApp()');
+                    exitedForSleepAt = Date.now();
+                    hiddenSinceExit = false;
                     window.decentApp.exitApp();
                 }
             } catch (err) {
@@ -2602,6 +2643,7 @@ export function initUI(callbacks) {
             }
         };
 
+        installReturnWake();
         setupPressAndHold(
             sleepButton,
             () => pressSleepButton(),

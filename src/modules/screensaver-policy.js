@@ -154,6 +154,37 @@ export function shouldExitAfterSleep(action, decentApp) {
 }
 
 /**
+ * A return to the page shortly after a long-press exit may be the exit itself
+ * settling (focus churn) rather than the user coming back. Unless the page was
+ * seen to go hidden, require at least this long away before waking.
+ */
+export const RETURN_WAKE_MIN_AWAY_MS = 1500;
+
+/**
+ * Should coming back to the app wake the machine?
+ *
+ * The de1app woke the machine when the app was reopened. Only after a long-press
+ * exit: leaving the app any other way while the machine sleeps is not a request
+ * to wake it. The last known state may still be 'idle' (or unknown) because the
+ * sleep confirmation can land after the app went to the background; waking an
+ * idle machine is a no-op. Any other state means the machine is awake and busy,
+ * so it is left alone.
+ *
+ * @param {object} p
+ * @param {number} p.exitedAt - Date.now() of the long-press exit; 0 = none.
+ * @param {boolean} p.wentHidden - the page was hidden after the exit.
+ * @param {string|null} p.machineState - last known machine state.
+ * @returns {'wake'|'skip'|'wait'} wake now; forget the exit; or keep waiting
+ *   for the real return.
+ */
+export function deriveReturnWake({ exitedAt, wentHidden, machineState, now = Date.now() } = {}) {
+    if (!exitedAt) return 'skip';
+    if (!wentHidden && (now - exitedAt) < RETURN_WAKE_MIN_AWAY_MS) return 'wait';
+    const state = String(machineState || '').toLowerCase();
+    return state === '' || state === 'idle' || isMachineAsleep(state) ? 'wake' : 'skip';
+}
+
+/**
  * What the panel brightness should do on a machine state TRANSITION.
  *
  * 'error' means the DE1 fell off BLE. It has to release the dim, because the only

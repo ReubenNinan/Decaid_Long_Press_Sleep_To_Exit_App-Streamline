@@ -125,3 +125,193 @@ index 56e64e5..195620a 100644
 -- 
 2.43.0
 
+From 59499ab72ff2aba9595e43c4e7b7349a806f2bff Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Tue, 10 Nov 2026 02:25:11 +0000
+Subject: [PATCH] Wake the machine when returning to the app after a long-press
+ exit
+
+The de1app woke the machine when it was reopened. After a long-press
+Sleep exit, the next return to the page (visibilitychange, focus or
+pageshow) hides the screensaver and sends the same single wake as a tap
+on it. Only after a long-press exit, and only when the machine is
+asleep, idle or unknown; a busy machine is never touched. A return
+within 1.5 s that was never hidden waits for the real one.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01WabCzdX53ns7vgwepG6uCf
+---
+ src/modules/screensaver-policy.js | 31 ++++++++++++++++++++
+ src/modules/ui.js                 | 47 +++++++++++++++++++++++++++++--
+ test/screensaver-policy.test.mjs  | 30 ++++++++++++++++++++
+ 3 files changed, 106 insertions(+), 2 deletions(-)
+
+diff --git a/src/modules/screensaver-policy.js b/src/modules/screensaver-policy.js
+index c1505e9..5b4fa39 100644
+--- a/src/modules/screensaver-policy.js
++++ b/src/modules/screensaver-policy.js
+@@ -153,6 +153,37 @@ export function shouldExitAfterSleep(action, decentApp) {
+     return action?.command === 'sleeping' && typeof decentApp?.exitApp === 'function';
+ }
+ 
++/**
++ * A return to the page shortly after a long-press exit may be the exit itself
++ * settling (focus churn) rather than the user coming back. Unless the page was
++ * seen to go hidden, require at least this long away before waking.
++ */
++export const RETURN_WAKE_MIN_AWAY_MS = 1500;
++
++/**
++ * Should coming back to the app wake the machine?
++ *
++ * The de1app woke the machine when the app was reopened. Only after a long-press
++ * exit: leaving the app any other way while the machine sleeps is not a request
++ * to wake it. The last known state may still be 'idle' (or unknown) because the
++ * sleep confirmation can land after the app went to the background; waking an
++ * idle machine is a no-op. Any other state means the machine is awake and busy,
++ * so it is left alone.
++ *
++ * @param {object} p
++ * @param {number} p.exitedAt - Date.now() of the long-press exit; 0 = none.
++ * @param {boolean} p.wentHidden - the page was hidden after the exit.
++ * @param {string|null} p.machineState - last known machine state.
++ * @returns {'wake'|'skip'|'wait'} wake now; forget the exit; or keep waiting
++ *   for the real return.
++ */
++export function deriveReturnWake({ exitedAt, wentHidden, machineState, now = Date.now() } = {}) {
++    if (!exitedAt) return 'skip';
++    if (!wentHidden && (now - exitedAt) < RETURN_WAKE_MIN_AWAY_MS) return 'wait';
++    const state = String(machineState || '').toLowerCase();
++    return state === '' || state === 'idle' || isMachineAsleep(state) ? 'wake' : 'skip';
++}
++
+ /**
+  * What the panel brightness should do on a machine state TRANSITION.
+  *
+diff --git a/src/modules/ui.js b/src/modules/ui.js
+index d3e17eb..d6befb2 100644
+--- a/src/modules/ui.js
++++ b/src/modules/ui.js
+@@ -4,7 +4,7 @@ import { getProfile, getWorkflow, updateWorkflow, setMachineState, setTargetHotW
+ import { resolveStatusStateKey, isActionTailSubstate } from './machine-status-policy.js';
+ import { openDB, getSetting } from './idb.js';
+ import { SCREENSAVER_CLOCK_FORMATS, SCREENSAVER_CLOCK_POSITIONS, SCREENSAVER_DATE_FORMATS, formatScreensaverClockDate, formatScreensaverClockTime, screensaverClockPositionStyle } from './screensaver-clock.js';
+-import { deriveSleepButtonAction, isWakePending, mayTapWakeMachine, shouldExitAfterSleep, SLEEP_EXIT_HOLD_MS } from './screensaver-policy.js';
++import { deriveSleepButtonAction, isWakePending, mayTapWakeMachine, shouldExitAfterSleep, deriveReturnWake, SLEEP_EXIT_HOLD_MS } from './screensaver-policy.js';
+ import { isBengleMachine, isBengleModel } from './machine.js';
+ import { STEAM_FLOW_PRESETS_BY_MODEL, MILK_STOP_PRESETS, resolveSteamFlowPresetsForModel, resolveSteamTileMode, steamSlotField as resolveSteamSlotField, milkTelemetryValue, steamFlowHighlightIndex, STEAM_SYNC_SYNCED, steamSyncField, foldSteamSyncState, shouldRetrySteamSync, steamSyncRetryDelay } from './steam-mode.js';
+ import { API_DEBOUNCE_MS } from './workflow-watch.js';
+@@ -2045,6 +2045,44 @@ export function wakeFromScreensaver() {
+     });
+ }
+ 
++// Long-press Sleep left the app; the next return to it wakes the machine.
++let exitedForSleepAt = 0;
++let hiddenSinceExit = false;
++let returnWakeInstalled = false;
++
++function installReturnWake() {
++    if (returnWakeInstalled) return;
++    returnWakeInstalled = true;
++    const onReturn = () => {
++        const decision = deriveReturnWake({
++            exitedAt: exitedForSleepAt,
++            wentHidden: hiddenSinceExit,
++            machineState: currentMachineState,
++        });
++        if (decision === 'wait') return;
++        exitedForSleepAt = 0;
++        hiddenSinceExit = false;
++        if (decision === 'skip') return;
++        // The same wake as a tap on the screensaver: hide it, suppress the stale
++        // 'sleeping' frames still in flight, and send the one wake command.
++        if (screensaverActive) hideScreensaver();
++        noteWakeRequested();
++        setMachineState('idle').catch((err) => {
++            logger.error('Return to app: failed to wake the machine:', err);
++            clearWakeRequest();
++        });
++    };
++    document.addEventListener('visibilitychange', () => {
++        if (document.visibilityState === 'hidden') {
++            if (exitedForSleepAt) hiddenSinceExit = true;
++            return;
++        }
++        onReturn();
++    });
++    window.addEventListener('focus', onReturn);
++    window.addEventListener('pageshow', onReturn);
++}
++
+ /** We have asked the machine to wake and are waiting for it to confirm. */
+ export function noteWakeRequested() {
+     wakeRequestedAt = Date.now();
+@@ -2587,7 +2625,11 @@ export function initUI(callbacks) {
+ 
+                 await setMachineState(action.command);
+                 logger.info(`Sleep button: machine reported "${currentMachineState}" -> requested "${action.command}".`);
+-                if (exitApp && shouldExitAfterSleep(action, window.decentApp)) window.decentApp.exitApp();
++                if (exitApp && shouldExitAfterSleep(action, window.decentApp)) {
++                    exitedForSleepAt = Date.now();
++                    hiddenSinceExit = false;
++                    window.decentApp.exitApp();
++                }
+             } catch (err) {
+                 logger.error(`Sleep button: failed to set machine state to "${action.command}":`, err);
+                 clearWakeRequest(); // the wake never landed — let the overlay come back
+@@ -2596,6 +2638,7 @@ export function initUI(callbacks) {
+             }
+         };
+ 
++        installReturnWake();
+         setupPressAndHold(
+             sleepButton,
+             () => pressSleepButton(),
+diff --git a/test/screensaver-policy.test.mjs b/test/screensaver-policy.test.mjs
+index 195620a..fd77132 100644
+--- a/test/screensaver-policy.test.mjs
++++ b/test/screensaver-policy.test.mjs
+@@ -21,6 +21,8 @@ import {
+     isMachineAsleep,
+     mayTapWakeMachine,
+     shouldExitAfterSleep,
++    deriveReturnWake,
++    RETURN_WAKE_MIN_AWAY_MS,
+     isWakePending,
+     WAKE_CONFIRM_GRACE_MS,
+ } from '../src/modules/screensaver-policy.js';
+@@ -284,3 +286,31 @@ test('a long press leaves the app only when it put the machine to sleep and the
+     assert.equal(shouldExitAfterSleep(sleep, {}), false, 'older hosts without exitApp just sleep');
+     assert.equal(shouldExitAfterSleep(sleep, undefined), false, 'external browsers have no decentApp');
+ });
++
++// --- deriveReturnWake: reopening the app after a long-press exit wakes the machine
++
++test('returning after a long-press exit wakes an asleep, idle or unknown machine', () => {
++    const now = 100_000;
++    const away = { exitedAt: now - 60_000, wentHidden: true, now };
++    assert.equal(deriveReturnWake({ ...away, machineState: 'sleeping' }), 'wake');
++    assert.equal(deriveReturnWake({ ...away, machineState: 'idle' }), 'wake', 'the sleep confirmation may not have arrived');
++    assert.equal(deriveReturnWake({ ...away, machineState: null }), 'wake');
++});
++
++test('returning never interrupts a busy machine', () => {
++    const now = 100_000;
++    for (const machineState of ['espresso', 'steam', 'hotWater', 'flush', 'heating', 'cleaning']) {
++        assert.equal(deriveReturnWake({ exitedAt: now - 60_000, wentHidden: true, machineState, now }), 'skip', machineState);
++    }
++});
++
++test('no long-press exit, no wake on return', () => {
++    assert.equal(deriveReturnWake({ exitedAt: 0, wentHidden: true, machineState: 'sleeping' }), 'skip');
++});
++
++test('focus churn right after the exit waits for the real return', () => {
++    const now = 100_000;
++    assert.equal(deriveReturnWake({ exitedAt: now - 200, wentHidden: false, machineState: 'sleeping', now }), 'wait');
++    assert.equal(deriveReturnWake({ exitedAt: now - 200, wentHidden: true, machineState: 'sleeping', now }), 'wake', 'hidden then visible is a real return');
++    assert.equal(deriveReturnWake({ exitedAt: now - RETURN_WAKE_MIN_AWAY_MS, wentHidden: false, machineState: 'sleeping', now }), 'wake');
++});
+-- 
+2.43.0
+

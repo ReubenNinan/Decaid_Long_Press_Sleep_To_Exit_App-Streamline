@@ -65,6 +65,10 @@ about 155 lines including tests and docs, against
 - **Tap Sleep:** unchanged; sleeps or wakes the machine.
 - **Hold Sleep for 0.8 s:** sleeps the machine, then calls `exitApp()` once
   Decaid accepts the sleep command.
+- **Reopen Decaid after a long-press exit:** goes straight to the Streamline
+  interface and wakes the machine, as the de1app did, with no extra tap on the
+  screensaver. A busy machine is never interrupted, and leaving the app any
+  other way doesn't trigger a wake.
 - **Hold "Awake":** only wakes the machine; it never exits.
 - **On Decaid without `exitApp()`:** behaves like a normal sleep, so the skin
   change is safe to ship before or after the Decaid change.
