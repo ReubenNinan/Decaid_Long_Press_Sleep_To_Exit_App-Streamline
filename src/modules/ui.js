@@ -2101,7 +2101,6 @@ function wakeOnReturn() {
         wentHidden: !!exit.hidden,
         machineState: currentMachineState,
     });
-    logger.warn(`[exit-test] return decision=${decision} state=${currentMachineState} hidden=${!!exit.hidden} awayMs=${Date.now() - exit.at}`);
     if (decision === 'wait') return;
     writeSleepExit(null);
     if (decision === 'wake') {
@@ -2657,8 +2656,6 @@ export function initUI(callbacks) {
         let sleepRequestInFlight = false;
 
         const pressSleepButton = async ({ exitApp = false } = {}) => {
-            // [exit-test] temporary diagnostics for the Decaid exitApp() tablet test.
-            if (exitApp) logger.warn(`[exit-test] long press detected; inFlight=${sleepRequestInFlight} state=${currentMachineState}`);
             if (sleepRequestInFlight) return;
             sleepRequestInFlight = true;
 
@@ -2684,9 +2681,7 @@ export function initUI(callbacks) {
 
                 await setMachineState(action.command);
                 logger.info(`Sleep button: machine reported "${currentMachineState}" -> requested "${action.command}".`);
-                if (exitApp) logger.warn(`[exit-test] sleep accepted; command=${action.command} host=${!!window.__DECENT_HOST__} decentApp=${window.decentApp ? Object.keys(window.decentApp).join(',') : 'none'} page=${location.href}`);
                 if (exitApp && shouldExitAfterSleep(action, window.decentApp)) {
-                    logger.warn('[exit-test] calling decentApp.exitApp()');
                     noteSleepExit();
                     window.decentApp.exitApp();
                 }
