@@ -4,10 +4,11 @@ A proposed change for **Decaid** and the **Streamline.js** skin that brings back
 a de1app feature: hold **Sleep** to put the machine to sleep and leave the app,
 so the tablet can be used normally while the machine stays asleep.
 
-> **Status: in review.** The Decaid change was accepted in
-> [decentespresso/decaid#1035](https://github.com/decentespresso/decaid/issues/1035)
-> and is in review as a pull request. Until a Decaid release includes it,
-> holding Sleep just puts the machine to sleep and shows the screensaver.
+> **Status: merged into Decaid.** `window.decentApp.exitApp()` landed in
+> [decentespresso/decaid#1134](https://github.com/decentespresso/decaid/pull/1134)
+> (issue [#1035](https://github.com/decentespresso/decaid/issues/1035)). Once
+> your Decaid release includes it, this skin's long press exits the app. On
+> older releases, holding Sleep just puts the machine to sleep.
 
 ## The problem
 
@@ -107,8 +108,8 @@ tested along the way.
 ## Next steps
 
 1. ~~Open an issue proposing `exitApp()`~~: accepted in decentespresso/decaid#1035.
-2. Decaid pull request: in review, with the maintainer's requested nonce
-   protection added.
+2. ~~Decaid pull request~~: merged in decentespresso/decaid#1134, with the
+   maintainer's requested nonce protection.
 3. Streamline.js: the long-press change is proposed in an issue on
    [decentespresso/streamline-js](https://github.com/decentespresso/streamline-js/issues),
    following its issue-first process.
